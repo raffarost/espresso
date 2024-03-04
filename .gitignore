@@ -1,0 +1,10 @@
+# Ignore folders
+build/
+main/build/
+docs/
+managed_components/
+.vscode/
+
+#Ignore backup files
+*.old
+
