@@ -8,13 +8,16 @@
    improved espresso extraction and consistency.
 
    https://github.com/raffarost/espresso
-   March 2024
+   March 2024 - April 2026
 
    Raffael Rostagno
    raffael.rostagno@gmail.com
 */
 
+#include <math.h>
+#include <stdio.h>
 #include <string.h>
+#include <stdint.h>
 #include <inttypes.h>
 #include "esp_err.h"
 #include "soc/soc_caps.h"
@@ -63,7 +66,8 @@
 
 #define GPIO_OUTPUT_IO_0    GPIO_NUM_4
 #define GPIO_OUTPUT_IO_1    0
-#define GPIO_OUTPUT_PIN_SEL  (1ULL << GPIO_OUTPUT_IO_0)
+/* Pump + triac gate: outputs defined early so pads are not floating through Wi-Fi / RainMaker init. */
+#define GPIO_OUTPUT_PIN_SEL  ((1ULL << GPIO_OUTPUT_IO_0) | (1ULL << TRIAC_1_GPIO))
 
 static const gpio_config_t gpio_outcfg = {
     .intr_type = GPIO_INTR_DISABLE,
@@ -92,6 +96,12 @@ if (ret != ESP_OK)  \
 
 #define CONTROL_TYPE    LOOKUP
 
+/* Overshoot learn/trim for LOOKUP only; on by default. Off: -DOVERSHOOT_DETECT_ENABLE=0 or #define 0 above. */
+#if (CONTROL_TYPE == LOOKUP) && !defined(OVERSHOOT_DETECT_ENABLE)
+#define OVERSHOOT_DETECT_ENABLE  1
+#endif
+
+
 #define BKP_NUM       10
 
 static float   deltaBkp[BKP_NUM] = {-10,  0, 0.5,  1,  2,  4, 10,  25,  50, 100};  /* temperature delta */
@@ -104,9 +114,33 @@ static float controlSet[BKP_NUM] = {  0,  0,   1,  1,  1,  1,  1,  80, 100, 100}
 #define BREW_PREINF_OFF     2
 #define BREW_ON             3
 #define BREW_POWER_OFF      4
+#define BREW_FLUSH          5
+
+#define FLUSH_PUMP_SEC      5   /* group-head flush: pump on duration */
+/* Pump-phase full-heat windows (us); preInfOnTime may change at runtime (RainMaker). */
+#define TIME_TEMP_BUFF_US        ((unsigned long long)SEC_TO_US((float)preInfOnTime / 2.f))
+#define TIME_FLUSH_HEAT_BUFF_US  ((unsigned long long)SEC_TO_US((float)FLUSH_PUMP_SEC / 2.f))
 
 #define TEMP_DELTA          2   /* temp delta from setpoint for good brewing temperature */
+#define TEMP_SETPOINT_MIN   88
+#define TEMP_SETPOINT_MAX   96
 #define MAX_TEMP_THR      110   /* maximum temperature threshold for safety control */
+
+#define TEMP_READ_OK_STREAK  3  /* consecutive good samples required before trusting */
+#define TEMP_VALID_MIN_C     (-2.0f)
+#define TEMP_VALID_MAX_C     (125.0f)
+#define TEMP_DIAG_SPI        (1u << 0)
+#define TEMP_DIAG_OPEN_TC    (1u << 1)
+#define TEMP_DIAG_RANGE      (1u << 2)
+
+/* Stuck sensor: high heater demand but temp unchanged for STUCK_DIAG_SAMPLES consecutive reads.
+ * Warmup grace delays counting until the sensor has proven responsive or the grace period elapses
+ * (the heater is physically far from the sensor, so a cold ramp reads flat for several seconds). */
+#define STUCK_DIAG_MIN_POWER_PCT     10
+#define STUCK_DIAG_SAMPLES           5     /* 2.5s @ 500ms cadence */
+#define STUCK_DIAG_TEMP_EPS          0.21f /* < half MAX6675 LSB (0.25°C) */
+#define STUCK_DIAG_CLEAR_MAX_C       110.f
+#define STUCK_DIAG_WARMUP_GRACE_SEC  10.f
 
 /* divisor factors for power reduction around temperature target */
 #define POWER_50            2
@@ -114,10 +148,18 @@ static float controlSet[BKP_NUM] = {  0,  0,   1,  1,  1,  1,  1,  80, 100, 100}
 #define POWER_25            4
 
 #define POWER_FACTOR        POWER_33
-#define TEMP_PWR_TOGGLE    10   /* temperature range around setpoint in which power is reduced to
-                                  a factor (above) of calibrated values for better stability */
+#define TEMP_PWR_TOGGLE    10   /* °C window around setpoint where power is dithered */
 
-#define POWERON_MIN         (15 * SEC_TO_US(60))    /* 15 minutes before entering standby (power off) mode */
+#define POWERON_MIN         (15 * SEC_TO_US(60))    /* standby timeout (15 min) */
+
+#if OVERSHOOT_DETECT_ENABLE
+#define OVERSHOOT_SOFT_DISARM_SEC          90.f
+#define OVERSHOOT_TRIM_DEMAND_PCT_THRESHOLD 20.0f  /* apply trim when control (%) is above this */
+#define OVERSHOOT_TRIM_FRAC_PER_DEG        0.02f  /* trim fraction added per °C of measured excursion */
+#define OVERSHOOT_TRIM_FRAC_MAX            0.15f  /* max cumulative trim fraction (0.15 = 15% cut) */
+#define OVERSHOOT_COLD_START_MAX_C         60.0f  /* arm learn only if boiler at/below this temp (°C) */
+#endif
+
 
 /*****************************************************************************
  * Module variables
@@ -126,14 +168,21 @@ static float controlSet[BKP_NUM] = {  0,  0,   1,  1,  1,  1,  1,  80, 100, 100}
 static const char *TAG = "espresso";
 esp_rmaker_device_t *espresso_device;
 
-/* these are used to report events/data to UI */
 esp_rmaker_param_t *primary;
-esp_rmaker_param_t *tempOk_param;
+static esp_rmaker_param_t *status_param;
 
-/* Heating element control */
+static char s_temp_line_str[40];
+static char s_status_str[96];
+
+/* Status latch: worst-severity issue shown until ~60s of clean Okay reports */
+#define STATUS_PRI_ZERO       25
+#define STATUS_PRI_UNTRUSTED  50
+#define STATUS_PRI_TOO_HIGH   75
+#define STATUS_PRI_STUCK      100
+#define STATUS_WORST_CLEAR_OK_REPORTS  12  /* Task5000ms ticks (~60s) */
+
 dimmertyp *ptr_dimmer;
 
-/* Task control */
 static int count100ms = 0;
 static int count500ms = 0;
 
@@ -147,7 +196,7 @@ spi_transaction_t tM = {
 };
 
 static float tempCelsius;
-static int tempSetpoint = 96;
+static int32_t tempSetpoint = 96;
 static float pidOut;
 static float delta;
 static int control;
@@ -155,14 +204,45 @@ static int powerToggle = 0;
 static unsigned long long pumpTimer = 0;
 static unsigned long long powerOnTimer = 0;
 static bool brewSignal = false;
-static int brewState = BREW_OFF;
-static int brewTime = 6;
+static bool flushSignal = false;
+static int brewState = BREW_POWER_OFF;
+static int32_t brewTime = 6;
 static bool tempRangeOk = false;
 static bool tempLock = true;
-static bool powerOn = true;
+static bool powerOn = false;
 static bool preInfusion = true;
-static int preInfOnTime = 3;
-static int preInfOffTime = 10;
+static int32_t preInfOnTime = 3;
+static int32_t preInfOffTime = 10;
+
+static bool temp_read_trusted;
+static uint8_t temp_read_good_streak;
+static uint32_t temp_read_fault_latch;
+
+static int s_status_worst_pri;
+static char s_status_worst_str[48];
+static uint16_t s_status_ok_clean_reports;
+
+static bool temp_stuck_diag;
+static float temp_stuck_prev_c;
+static uint8_t temp_stuck_same_ct;
+static bool temp_sensor_responsive;          /* latched once the sensor moves under heat demand */
+static unsigned long long temp_stuck_warmup_start_us; /* t0 of the cold-start warmup grace window */
+
+#if OVERSHOOT_DETECT_ENABLE
+static esp_rmaker_param_t *overshoot_disp_param;
+static char s_overshoot_disp_str[28];
+static float overshoot_trim_stored;         /* NVS-persisted power cut fraction (0..TRIM_FRAC_MAX) */
+static float overshoot_excursion_pk;        /* peak (temp - setpoint) °C of the active excursion */
+static bool overshoot_excursion_latched;    /* clears at temp <= setpoint; triggers commit once */
+static bool overshoot_detected;             /* sticky: crossed setpoint+TEMP_DELTA this arm cycle */
+static bool overshoot_learn_allowed = false;
+static bool overshoot_learn_ever_armed;     /* cold arm succeeded at least once this power session */
+#define OS_DISARM_SOFT_TIMEOUT  (1u << 0)
+#define OS_DISARM_COMMIT        (1u << 1)
+static uint32_t overshoot_learn_disarm_mask;
+static bool overshoot_boot_temp_sampled;
+static unsigned long long overshoot_soft_timer_start_us;
+#endif
 
 static esp_rmaker_param_t *poweron_param;
 
@@ -179,6 +259,20 @@ void heatingControl(void);
 void brewProgram(void);
 void nvsRead(void);
 void nvsWrite(void);
+static void temp_stuck_diag_update(int heating_demand_pct);
+static bool boiler_heater_holdoff(void);
+static void temp_status_line_report(void);
+static void boiler_status_report(void);
+#if OVERSHOOT_DETECT_ENABLE
+static void overshoot_learn_try_arm_cold(const char *site);
+static void overshoot_peak_detector_update(void);
+static void overshoot_disp_format_str(void);
+static void overshoot_disp_report(void);
+static void nvs_read_overshoot_trim(nvs_handle_t h);
+static void nvs_persist_overshoot_trim(void);
+static void overshoot_apply_trim_to_control(int *p_control);
+static void overshoot_learn_set_disallowed(uint32_t reason_bits);
+#endif
 
 /*****************************************************************************
  * Function declaration
@@ -193,13 +287,19 @@ static esp_err_t write_cb(const esp_rmaker_device_t *device, const esp_rmaker_pa
     }
     
     /* Save to local variable */
-    if (strcmp(esp_rmaker_param_get_name(param), "Temperature Setpoint") == 0)
+    if (strcmp(esp_rmaker_param_get_name(param), "Temperature setpoint (\xc2\xb0""C)") == 0)
     {
-        tempSetpoint = val.val.i;
+        int32_t sp = val.val.i;
+        if (sp < TEMP_SETPOINT_MIN) {
+            sp = TEMP_SETPOINT_MIN;
+        } else if (sp > TEMP_SETPOINT_MAX) {
+            sp = TEMP_SETPOINT_MAX;
+        }
+        tempSetpoint = sp;
         ESP_LOGI(TAG, "New temperature setpoint: %d", tempSetpoint);
     }
 
-    if (strcmp(esp_rmaker_param_get_name(param), "Brew Time") == 0)
+    if (strcmp(esp_rmaker_param_get_name(param), "Brew time (s)") == 0)
     {
         brewTime = val.val.i;
         ESP_LOGI(TAG, "Brew Time: %d s", brewTime);
@@ -211,6 +311,12 @@ static esp_err_t write_cb(const esp_rmaker_device_t *device, const esp_rmaker_pa
         ESP_LOGI(TAG, "Brew %s!", brewSignal ? "start" : "stop");
     }
 
+    if (strcmp(esp_rmaker_param_get_name(param), "Flush") == 0)
+    {
+        flushSignal = val.val.b ? !flushSignal : flushSignal;
+        ESP_LOGI(TAG, "Flush %s!", flushSignal ? "on" : "off");
+    }
+
     if (strcmp(esp_rmaker_param_get_name(param), "Pre-Infusion") == 0)
     {
         preInfusion = val.val.b;
@@ -219,8 +325,17 @@ static esp_err_t write_cb(const esp_rmaker_device_t *device, const esp_rmaker_pa
 
     if (strcmp(esp_rmaker_param_get_name(param), "Power") == 0)
     {
+        const bool was_on = powerOn;
         powerOn = val.val.b;
         ESP_LOGI(TAG, "Power is set to %s", powerOn ? "ON" : "OFF");
+#if OVERSHOOT_DETECT_ENABLE
+        if (!powerOn && was_on) {
+            overshoot_learn_ever_armed = false;
+        }
+        if (powerOn && !was_on) {
+            overshoot_learn_try_arm_cold("Power cb");
+        }
+#endif
     }
 
     if (strcmp(esp_rmaker_param_get_name(param), "Temp Lock") == 0)
@@ -229,17 +344,36 @@ static esp_err_t write_cb(const esp_rmaker_device_t *device, const esp_rmaker_pa
         ESP_LOGI(TAG, "Temp Lock set to %s", tempLock ? "ON" : "OFF");
     }
 
-    if (strcmp(esp_rmaker_param_get_name(param), "Pre-Infusion On Time") == 0)
+    if (strcmp(esp_rmaker_param_get_name(param), "Pre-Infusion on time (s)") == 0)
     {
         preInfOnTime = val.val.i;
         ESP_LOGI(TAG, "Pre-Infusion On Time: %d s", preInfOnTime);
     }
 
-    if (strcmp(esp_rmaker_param_get_name(param), "Pre-Infusion Off Time") == 0)
+    if (strcmp(esp_rmaker_param_get_name(param), "Pre-Infusion off time (s)") == 0)
     {
         preInfOffTime = val.val.i;
         ESP_LOGI(TAG, "Pre-Infusion Off Time: %d s", preInfOffTime);
     }
+
+#if OVERSHOOT_DETECT_ENABLE
+    if (strcmp(esp_rmaker_param_get_name(param), "Reset power trim") == 0)
+    {
+        if (val.val.b) {
+            overshoot_trim_stored = 0.f;
+            overshoot_learn_allowed = true;
+            overshoot_learn_ever_armed = false;
+            overshoot_learn_disarm_mask = 0u;
+            overshoot_soft_timer_start_us = 0;
+            overshoot_detected = false;
+            overshoot_excursion_latched = false;
+            overshoot_excursion_pk = 0.f;
+            nvs_persist_overshoot_trim();
+            ESP_LOGI(TAG, "Warmup trim reset (NVS cleared, learn re-armed if cold)");
+            overshoot_disp_report();
+        }
+    }
+#endif
 
     return ESP_OK;
 }
@@ -352,8 +486,10 @@ void dimInit(void)
 
 void gpioConfig(void)
 {
-    /* configure GPIO output pins */
-    gpio_config(&gpio_outcfg); 
+    /* Outputs: pump off, triac gate held low (dimmer driver re-configures GPIO33 later). */
+    gpio_config(&gpio_outcfg);
+    gpio_set_level(GPIO_OUTPUT_IO_0, 0);
+    gpio_set_level(TRIAC_1_GPIO, 0);
 }
 
 void nvsRead(void)
@@ -369,13 +505,25 @@ void nvsRead(void)
     }
     else
     {
-        /* Read */
-        nvs_get_u8(nvs_handle, "tempLock", &tempLock);
+        /* Read (NVS APIs use fixed-width types; not bool* / int*) */
+        uint8_t u8 = 0;
+        nvs_get_u8(nvs_handle, "tempLock", &u8);
+        tempLock = u8 != 0;
         nvs_get_i32(nvs_handle, "tempSetpoint", &tempSetpoint);
+        if (tempSetpoint < TEMP_SETPOINT_MIN) {
+            tempSetpoint = TEMP_SETPOINT_MIN;
+        } else if (tempSetpoint > TEMP_SETPOINT_MAX) {
+            tempSetpoint = TEMP_SETPOINT_MAX;
+        }
         nvs_get_i32(nvs_handle, "brewTime", &brewTime);
-        nvs_get_u8(nvs_handle, "preInfusion", &preInfusion);
+        nvs_get_u8(nvs_handle, "preInfusion", &u8);
+        preInfusion = u8 != 0;
         nvs_get_i32(nvs_handle, "preInfOnTime", &preInfOnTime);
         nvs_get_i32(nvs_handle, "preInfOffTime", &preInfOffTime);
+
+#if OVERSHOOT_DETECT_ENABLE
+        nvs_read_overshoot_trim(nvs_handle);
+#endif
 
         nvs_close(nvs_handle);
     }    
@@ -395,12 +543,14 @@ void nvsWrite(void)
     else
     {
         /* Write */
-        ESP_ERROR_CHECK(nvs_set_u8(nvs_handle, "tempLock", tempLock));
+        ESP_ERROR_CHECK(nvs_set_u8(nvs_handle, "tempLock", (uint8_t)tempLock));
         ESP_ERROR_CHECK(nvs_set_i32(nvs_handle, "tempSetpoint", tempSetpoint));
         ESP_ERROR_CHECK(nvs_set_i32(nvs_handle, "brewTime", brewTime));
-        ESP_ERROR_CHECK(nvs_set_u8(nvs_handle, "preInfusion", preInfusion));
+        ESP_ERROR_CHECK(nvs_set_u8(nvs_handle, "preInfusion", (uint8_t)preInfusion));
         ESP_ERROR_CHECK(nvs_set_i32(nvs_handle, "preInfOnTime", preInfOnTime));
         ESP_ERROR_CHECK(nvs_set_i32(nvs_handle, "preInfOffTime", preInfOffTime));
+
+        /* trimMp is written only from nvs_persist_overshoot_trim() on learn commit. */
 
         ESP_LOGI(TAG, "Committing updates in NVS ... ");
         
@@ -408,6 +558,347 @@ void nvsWrite(void)
 
         nvs_close(nvs_handle);
     }    
+}
+
+#if OVERSHOOT_DETECT_ENABLE
+/* Trim stored as milli-percent in NVS (int32); 100 = 0.1% */
+#define OVERSHOOT_TRIM_FRAC_TO_MPCT(f) ((int32_t)lroundf((f) * 100000.0f))
+#define OVERSHOOT_TRIM_MPCT_TO_FRAC(i) ((float)(i) * 0.00001f)
+
+static void nvs_read_overshoot_trim(nvs_handle_t h)
+{
+    int32_t mpct = 0;
+    if (nvs_get_i32(h, "trimMp", &mpct) == ESP_OK && mpct >= 0) {
+        overshoot_trim_stored = fminf(OVERSHOOT_TRIM_MPCT_TO_FRAC(mpct), OVERSHOOT_TRIM_FRAC_MAX);
+        ESP_LOGI(TAG, "Warmup trim loaded: -%.2f%%", (double)(overshoot_trim_stored * 100.0f));
+        return;
+    }
+
+    /* Legacy: "pkOsm" was cumulative °C; migrate once to "trimMp" then erase. */
+    int32_t milli_c = 0;
+    if (nvs_get_i32(h, "pkOsm", &milli_c) == ESP_OK && milli_c > 0) {
+        const float cumulative_c = (float)milli_c * 0.001f;
+        overshoot_trim_stored = fminf(OVERSHOOT_TRIM_FRAC_PER_DEG * cumulative_c,
+                                      OVERSHOOT_TRIM_FRAC_MAX);
+        esp_err_t e = nvs_set_i32(h, "trimMp",
+                                  OVERSHOOT_TRIM_FRAC_TO_MPCT(overshoot_trim_stored));
+        if (e == ESP_OK) {
+            nvs_erase_key(h, "pkOsm");
+            nvs_commit(h);
+        }
+        ESP_LOGI(TAG, "Warmup trim migrated: pkOsm=%.2f°C -> -%.2f%%",
+                 (double)cumulative_c, (double)(overshoot_trim_stored * 100.0f));
+        return;
+    }
+
+    overshoot_trim_stored = 0.f;
+}
+
+static void nvs_persist_overshoot_trim(void)
+{
+    nvs_handle_t h;
+    if (nvs_open("storage", NVS_READWRITE, &h) != ESP_OK) {
+        return;
+    }
+    esp_err_t e = nvs_set_i32(h, "trimMp", OVERSHOOT_TRIM_FRAC_TO_MPCT(overshoot_trim_stored));
+    if (e == ESP_OK) {
+        e = nvs_commit(h);
+    }
+    if (e != ESP_OK) {
+        ESP_LOGW(TAG, "trimMp NVS save failed: %s", esp_err_to_name(e));
+    }
+    nvs_close(h);
+}
+
+static void overshoot_apply_trim_to_control(int *p_control)
+{
+    if ((float)*p_control > (float)OVERSHOOT_TRIM_DEMAND_PCT_THRESHOLD) {
+        float cf = (float)*p_control * (1.f - overshoot_trim_stored);
+        *p_control = (int)(cf + 0.5f);
+    }
+}
+
+static void overshoot_learn_set_disallowed(uint32_t reason_bits)
+{
+    overshoot_learn_disarm_mask |= reason_bits;
+    overshoot_learn_allowed = false;
+}
+
+static void overshoot_learn_try_arm_cold(const char *site)
+{
+    if (!powerOn) {
+        return;
+    }
+    if (!temp_read_trusted) {
+        return;
+    }
+    if (tempCelsius > OVERSHOOT_COLD_START_MAX_C) {
+        return;
+    }
+    overshoot_learn_allowed = true;
+    overshoot_learn_ever_armed = true;
+    overshoot_learn_disarm_mask = 0u;
+    overshoot_excursion_latched = false;
+    overshoot_excursion_pk = 0.f;
+    overshoot_soft_timer_start_us = 0;
+    overshoot_detected = false;
+    ESP_LOGI(TAG, "OS arm[%s] OK: cold start @ %.1f°C (trim pre-loaded -%.2f%%)",
+             site, (double)tempCelsius, (double)(overshoot_trim_stored * 100.0f));
+}
+
+
+static void overshoot_peak_detector_update(void)
+{
+    if (!overshoot_learn_allowed) {
+        return;
+    }
+    if (temp_stuck_diag) {
+        return;
+    }
+
+    const float temp_ok_max_threshold = (float)tempSetpoint + (float)TEMP_DELTA;
+
+    if (tempCelsius > temp_ok_max_threshold) {
+        overshoot_detected = true;
+        overshoot_excursion_latched = true;
+    }
+
+    if (!overshoot_detected) {
+        if (overshoot_soft_timer_start_us == 0ULL && tempCelsius >= (float)tempSetpoint) {
+            overshoot_soft_timer_start_us = getAbsTime1us();
+        } else if (overshoot_soft_timer_start_us != 0ULL &&
+                   (getAbsTime1us() - overshoot_soft_timer_start_us) >=
+                       (unsigned long long)SEC_TO_US(OVERSHOOT_SOFT_DISARM_SEC)) {
+            overshoot_learn_set_disallowed(OS_DISARM_SOFT_TIMEOUT);
+            overshoot_soft_timer_start_us = 0;
+            overshoot_detected = false;
+            overshoot_excursion_latched = false;
+            overshoot_excursion_pk = 0.f;
+            ESP_LOGI(TAG,
+                     "OS learn disarmed (soft): no temp above setpoint+%d°C within %.0fs",
+                     TEMP_DELTA, (double)OVERSHOOT_SOFT_DISARM_SEC);
+            overshoot_disp_report();
+            return;
+        }
+    }
+
+    if (overshoot_excursion_latched && tempCelsius > (float)tempSetpoint) {
+        const float temp_above_setpoint_c = tempCelsius - (float)tempSetpoint;
+        overshoot_excursion_pk = fmaxf(overshoot_excursion_pk, temp_above_setpoint_c);
+    }
+
+    if (tempCelsius <= (float)tempSetpoint) {
+        if (overshoot_excursion_latched) {
+            if (overshoot_excursion_pk > 0.01f) {
+                const float peak_c = overshoot_excursion_pk;
+                const float trim_add = OVERSHOOT_TRIM_FRAC_PER_DEG * peak_c;
+                const float trim_prev = overshoot_trim_stored;
+                overshoot_trim_stored = fminf(overshoot_trim_stored + trim_add,
+                                              OVERSHOOT_TRIM_FRAC_MAX);
+                ESP_LOGI(TAG,
+                         "OS commit: peak +%.2f°C -> cut +%.2f%% (-%.2f%% -> -%.2f%%%s)",
+                         (double)peak_c,
+                         (double)(trim_add * 100.0f),
+                         (double)(trim_prev * 100.0f),
+                         (double)(overshoot_trim_stored * 100.0f),
+                         (overshoot_trim_stored >= OVERSHOOT_TRIM_FRAC_MAX - 1e-6f) ? ", CAPPED" : "");
+                nvs_persist_overshoot_trim();
+                overshoot_learn_set_disallowed(OS_DISARM_COMMIT);
+                overshoot_soft_timer_start_us = 0;
+                overshoot_detected = false;
+            }
+            overshoot_excursion_pk = 0.f;
+        }
+        overshoot_excursion_latched = false;
+    }
+}
+
+static void overshoot_disp_format_str(void)
+{
+    const float cut_pct = overshoot_trim_stored * 100.0f;
+    if (overshoot_learn_allowed && overshoot_excursion_latched && overshoot_excursion_pk > 0.01f) {
+        snprintf(s_overshoot_disp_str, sizeof(s_overshoot_disp_str),
+                 "-%.1f%% +%.1f°C", (double)cut_pct, (double)overshoot_excursion_pk);
+    } else {
+        snprintf(s_overshoot_disp_str, sizeof(s_overshoot_disp_str), "-%.1f%%", (double)cut_pct);
+    }
+}
+
+static void overshoot_disp_report(void)
+{
+    if (!powerOn) {
+        return;
+    }
+    overshoot_disp_format_str();
+    if (overshoot_disp_param) {
+        esp_err_t e = esp_rmaker_param_update_and_report(overshoot_disp_param,
+                                                         esp_rmaker_str(s_overshoot_disp_str));
+        if (e != ESP_OK) {
+            ESP_LOGW(TAG, "Overshoot display: %s", esp_err_to_name(e));
+        }
+    }
+}
+
+#endif
+
+static void temp_stuck_diag_update(int heating_demand_pct)
+{
+    const float t = tempCelsius;
+
+    /* Reset session state on power off; stuck latch clears only when the reading moves. */
+    if (!powerOn) {
+        temp_stuck_same_ct = 0u;
+        temp_stuck_warmup_start_us = 0ULL;
+        temp_sensor_responsive = false;
+        temp_stuck_prev_c = t;
+        return;
+    }
+
+    if (temp_stuck_diag) {
+        if (temp_read_trusted && t > 0.f && t < STUCK_DIAG_CLEAR_MAX_C &&
+            fabsf(t - temp_stuck_prev_c) >= STUCK_DIAG_TEMP_EPS) {
+            temp_stuck_diag = false;
+            temp_stuck_same_ct = 1u;
+            temp_stuck_prev_c = t;
+            temp_sensor_responsive = true;
+            ESP_LOGI(TAG, "Boiler temp stuck diag cleared (reading moved in range)");
+        }
+        return;
+    }
+
+    if (!temp_read_trusted || t <= 0.f || t >= STUCK_DIAG_CLEAR_MAX_C) {
+        temp_stuck_same_ct = 0u;
+        temp_stuck_prev_c = t;
+        return;
+    }
+
+    if (heating_demand_pct < STUCK_DIAG_MIN_POWER_PCT) {
+        temp_stuck_same_ct = 0u;
+        temp_stuck_prev_c = t;
+        if (!temp_sensor_responsive) {
+            temp_stuck_warmup_start_us = 0ULL;
+        }
+        return;
+    }
+
+    /* First heating sample pre-responsive: anchor and start warmup timer. */
+    if (!temp_sensor_responsive && temp_stuck_warmup_start_us == 0ULL) {
+        temp_stuck_warmup_start_us = getAbsTime1us();
+        temp_stuck_prev_c = t;
+        temp_stuck_same_ct = 0u;
+        return;
+    }
+
+    if (fabsf(t - temp_stuck_prev_c) >= STUCK_DIAG_TEMP_EPS) {
+        if (!temp_sensor_responsive) {
+            ESP_LOGI(TAG, "Boiler temp sensor responsive (%.2f -> %.2f C)",
+                     (double)temp_stuck_prev_c, (double)t);
+        }
+        temp_sensor_responsive = true;
+        temp_stuck_same_ct = 1u;
+        temp_stuck_prev_c = t;
+        return;
+    }
+
+    /* Pre-responsive: skip counting until warmup grace elapses. */
+    if (!temp_sensor_responsive) {
+        const unsigned long long warmup_elapsed = getAbsTime1us() - temp_stuck_warmup_start_us;
+        if (warmup_elapsed < (unsigned long long)SEC_TO_US(STUCK_DIAG_WARMUP_GRACE_SEC)) {
+            return;
+        }
+    }
+
+    if (temp_stuck_same_ct < 255) {
+        temp_stuck_same_ct++;
+    }
+    if (temp_stuck_same_ct >= STUCK_DIAG_SAMPLES) {
+        temp_stuck_diag = true;
+        ESP_LOGW(TAG,
+                 "Boiler temp stuck diag: demand >= %d%%, %d identical samples (~%.2f C, %s)",
+                 STUCK_DIAG_MIN_POWER_PCT, STUCK_DIAG_SAMPLES, (double)t,
+                 temp_sensor_responsive ? "post-movement" : "warmup grace elapsed");
+    }
+}
+
+static bool boiler_heater_holdoff(void)
+{
+    return !temp_read_trusted || (tempCelsius == 0.f) || (tempCelsius > (float)MAX_TEMP_THR) ||
+           temp_stuck_diag;
+}
+
+static void temp_status_line_report(void)
+{
+    const char *state;
+    if (tempRangeOk) {
+        state = "Ready";
+    } else if (tempCelsius < (float)(tempSetpoint - TEMP_DELTA)) {
+        state = "Low";
+    } else {
+        state = "High";
+    }
+    snprintf(s_temp_line_str, sizeof(s_temp_line_str), "%.1f \xc2\xb7 %s", (double)tempCelsius, state);
+    if (primary) {
+        esp_err_t e = esp_rmaker_param_update_and_report(primary, esp_rmaker_str(s_temp_line_str));
+        if (e != ESP_OK) {
+            ESP_LOGW(TAG, "Temperature line: %s", esp_err_to_name(e));
+        }
+    }
+}
+
+static void boiler_status_report(void)
+{
+    int cur_pri = 0;
+    const char *cur_msg = "Okay";
+
+    if (temp_stuck_diag) {
+        cur_pri = STATUS_PRI_STUCK;
+        cur_msg = "Temp sensor stuck";
+    } else if (!temp_read_trusted) {
+        cur_pri = STATUS_PRI_UNTRUSTED;
+        cur_msg = "Temp not trusted";
+    } else if (tempCelsius <= 0.f) {
+        cur_pri = STATUS_PRI_ZERO;
+        cur_msg = "Temp zero";
+    } else if (tempCelsius > (float)MAX_TEMP_THR) {
+        cur_pri = STATUS_PRI_TOO_HIGH;
+        cur_msg = "Temp too high";
+    }
+
+    if (cur_pri > s_status_worst_pri) {
+        s_status_worst_pri = cur_pri;
+        snprintf(s_status_worst_str, sizeof(s_status_worst_str), "%s", cur_msg);
+    }
+
+    if (cur_pri == 0) {
+        if (s_status_worst_pri > 0) {
+            if (s_status_ok_clean_reports + 1u >= (uint16_t)STATUS_WORST_CLEAR_OK_REPORTS) {
+                s_status_worst_pri = 0;
+                s_status_worst_str[0] = '\0';
+                s_status_ok_clean_reports = 0;
+                snprintf(s_status_str, sizeof(s_status_str), "Okay");
+            } else {
+                s_status_ok_clean_reports++;
+                snprintf(s_status_str, sizeof(s_status_str), "Okay (%s)", s_status_worst_str);
+            }
+        } else {
+            snprintf(s_status_str, sizeof(s_status_str), "Okay");
+            s_status_ok_clean_reports = 0;
+        }
+    } else {
+        s_status_ok_clean_reports = 0;
+        if (s_status_worst_pri > cur_pri && s_status_worst_str[0] != '\0') {
+            snprintf(s_status_str, sizeof(s_status_str), "%s (%s)", cur_msg, s_status_worst_str);
+        } else {
+            snprintf(s_status_str, sizeof(s_status_str), "%s", cur_msg);
+        }
+    }
+
+    if (status_param) {
+        esp_err_t e = esp_rmaker_param_update_and_report(status_param, esp_rmaker_str(s_status_str));
+        if (e != ESP_OK) {
+            ESP_LOGW(TAG, "Status: %s", esp_err_to_name(e));
+        }
+    }
 }
 
 unsigned long long getAbsTime1us(void)
@@ -419,30 +910,82 @@ unsigned long long getAbsTime1us(void)
     return timerVal;
 }
 
+static void temp_read_note_fault(uint32_t bit)
+{
+    temp_read_good_streak = 0;
+    temp_read_trusted = false;
+    const uint32_t prev = temp_read_fault_latch;
+    temp_read_fault_latch |= bit;
+    if (temp_read_fault_latch != prev) {
+        ESP_LOGW(TAG, "Boiler temp read fault (latch 0x%02" PRIx32 ")", temp_read_fault_latch);
+    }
+}
+
+static void temp_read_note_good(float celsius)
+{
+    tempCelsius = celsius;
+    if (temp_read_good_streak < 255) {
+        temp_read_good_streak++;
+    }
+    if (temp_read_good_streak >= TEMP_READ_OK_STREAK) {
+        if (!temp_read_trusted) {
+            ESP_LOGI(TAG, "Boiler temp read now trusted");
+        }
+        temp_read_trusted = true;
+        temp_read_fault_latch = 0;
+    }
+}
+
 void spiComm(void)
 {
-    esp_err_t ret;
-
-    ret = spi_device_acquire_bus(spi, portMAX_DELAY);
-    CHECK_RET(ret, "Error opening SPI");
+    esp_err_t ret = spi_device_acquire_bus(spi, portMAX_DELAY);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "SPI acquire bus failed: %s", esp_err_to_name(ret));
+        temp_read_note_fault(TEMP_DIAG_SPI);
+        return;
+    }
     ret = spi_device_transmit(spi, &tM);
-    CHECK_RET(ret, "Error TX SPI");
     spi_device_release_bus(spi);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "SPI transmit failed: %s", esp_err_to_name(ret));
+        temp_read_note_fault(TEMP_DIAG_SPI);
+        return;
+    }
 
-    int16_t res = (int16_t) SPI_SWAP_DATA_RX(data, 16);
+    const int16_t res = (int16_t) SPI_SWAP_DATA_RX(data, 16);
 
     if (res & (1 << 2)) {
-      res = 0;
-      ESP_LOGE(TAG, "Sensor is not connected");
+        ESP_LOGE(TAG, "Thermocouple open (MAX6675 fault bit)");
+        temp_read_note_fault(TEMP_DIAG_OPEN_TC);
+        return;
     }
-    else {
-      res >>= 3;
-      tempCelsius = (float)(res * 0.25);
+
+    const int16_t shifted = (int16_t)(res >> 3);
+    const float c = (float)shifted * 0.25f;
+    if (c < TEMP_VALID_MIN_C || c > TEMP_VALID_MAX_C) {
+        ESP_LOGW(TAG, "Boiler temp out of range: %.2f C", (double)c);
+        temp_read_note_fault(TEMP_DIAG_RANGE);
+        return;
     }
+
+    temp_read_note_good(c);
+}
+
+bool boiler_temp_is_trusted(void)
+{
+    return temp_read_trusted;
+}
+
+uint32_t boiler_temp_fault_bits(void)
+{
+    return temp_read_fault_latch;
 }
 
 void app_main()
 {
+    /* Pump + triac gate: outputs low before any timers, NVS, or network (pads not floating). */
+    gpioConfig();
+
     /* Init general purpose free running timer (1us resolution)*/
     ESP_ERROR_CHECK(gptimer_new_timer(&timer_config, &freeRunTimer));
     ESP_ERROR_CHECK(gptimer_enable(freeRunTimer));
@@ -503,19 +1046,14 @@ void app_main()
      */
     esp_rmaker_device_add_cb(espresso_device, write_cb, NULL);
 
-    /* Adding temperature display to device */
-    esp_rmaker_device_add_param(espresso_device, esp_rmaker_name_param_create(ESP_RMAKER_DEF_NAME_PARAM, "Espresso"));
+    /* No ESP_RMAKER_DEF_NAME_PARAM — saves a redundant name row in the phone UI. */
 
-    primary = esp_rmaker_param_create("Temperature", ESP_RMAKER_PARAM_TEMPERATURE, esp_rmaker_float(0), PROP_FLAG_READ);
+    snprintf(s_temp_line_str, sizeof(s_temp_line_str), "--");
+    primary = esp_rmaker_param_create("Temperature (\xc2\xb0""C)", NULL, esp_rmaker_str(s_temp_line_str), PROP_FLAG_READ);
     esp_rmaker_param_add_ui_type(primary, ESP_RMAKER_UI_TEXT);
     esp_rmaker_device_add_param(espresso_device, primary);
     esp_rmaker_device_assign_primary_param(espresso_device, primary);
 
-    /* Creating temperature setpoint OK */
-    tempOk_param = esp_rmaker_param_create("Temperature OK", NULL, esp_rmaker_bool(false), PROP_FLAG_READ);
-    esp_rmaker_param_add_ui_type(tempOk_param, ESP_RMAKER_UI_TOGGLE);
-    esp_rmaker_device_add_param(espresso_device, tempOk_param);  
-  
     /* Creating Power Up toggle switch */
     poweron_param = esp_rmaker_param_create("Power", NULL, esp_rmaker_bool(powerOn), PROP_FLAG_READ | PROP_FLAG_WRITE);
     esp_rmaker_param_add_ui_type(poweron_param, ESP_RMAKER_UI_TOGGLE);
@@ -525,6 +1063,11 @@ void app_main()
     esp_rmaker_param_t *brewSig_param = esp_rmaker_param_create("Brew Signal", NULL, esp_rmaker_bool(false), PROP_FLAG_READ | PROP_FLAG_WRITE);
     esp_rmaker_param_add_ui_type(brewSig_param, ESP_RMAKER_UI_TRIGGER);
     esp_rmaker_device_add_param(espresso_device, brewSig_param);
+
+    esp_rmaker_param_t *flush_param = esp_rmaker_param_create("Flush", NULL, esp_rmaker_bool(false),
+                                                              PROP_FLAG_READ | PROP_FLAG_WRITE);
+    esp_rmaker_param_add_ui_type(flush_param, ESP_RMAKER_UI_TRIGGER);
+    esp_rmaker_device_add_param(espresso_device, flush_param);
   
     /* Creating Temperature Lock toggle switch */
     esp_rmaker_param_t *templock_param = esp_rmaker_param_create("Temp Lock", NULL, esp_rmaker_bool(tempLock), PROP_FLAG_READ | PROP_FLAG_WRITE);
@@ -532,13 +1075,16 @@ void app_main()
     esp_rmaker_device_add_param(espresso_device, templock_param);
 
     /* Creating slider object */
-    esp_rmaker_param_t *temp_param = esp_rmaker_param_create("Temperature Setpoint", NULL, esp_rmaker_int(tempSetpoint), PROP_FLAG_READ | PROP_FLAG_WRITE);
+    esp_rmaker_param_t *temp_param = esp_rmaker_param_create("Temperature setpoint (\xc2\xb0""C)", NULL,
+                                                             esp_rmaker_int(tempSetpoint), PROP_FLAG_READ | PROP_FLAG_WRITE);
     esp_rmaker_param_add_ui_type(temp_param, ESP_RMAKER_UI_SLIDER);
-    esp_rmaker_param_add_bounds(temp_param, esp_rmaker_int(90), esp_rmaker_int(110), esp_rmaker_int(1));
+    esp_rmaker_param_add_bounds(temp_param, esp_rmaker_int(TEMP_SETPOINT_MIN), esp_rmaker_int(TEMP_SETPOINT_MAX),
+                                esp_rmaker_int(1));
     esp_rmaker_device_add_param(espresso_device, temp_param);
 
     /* Creating slider object */
-    esp_rmaker_param_t *brewtime_param = esp_rmaker_param_create("Brew Time", NULL, esp_rmaker_int(brewTime), PROP_FLAG_READ | PROP_FLAG_WRITE);
+    esp_rmaker_param_t *brewtime_param = esp_rmaker_param_create("Brew time (s)", NULL, esp_rmaker_int(brewTime),
+                                                                 PROP_FLAG_READ | PROP_FLAG_WRITE);
     esp_rmaker_param_add_ui_type(brewtime_param, ESP_RMAKER_UI_SLIDER);
     esp_rmaker_param_add_bounds(brewtime_param, esp_rmaker_int(6), esp_rmaker_int(20), esp_rmaker_int(1));
     esp_rmaker_device_add_param(espresso_device, brewtime_param);
@@ -549,16 +1095,39 @@ void app_main()
     esp_rmaker_device_add_param(espresso_device, preinf_param);
 
     /* Pre-Infusion On Time slider object */
-    esp_rmaker_param_t *preinfOn_param = esp_rmaker_param_create("Pre-Infusion On Time", NULL, esp_rmaker_int(preInfOnTime), PROP_FLAG_READ | PROP_FLAG_WRITE);
+    esp_rmaker_param_t *preinfOn_param = esp_rmaker_param_create("Pre-Infusion on time (s)", NULL,
+                                                                 esp_rmaker_int(preInfOnTime), PROP_FLAG_READ | PROP_FLAG_WRITE);
     esp_rmaker_param_add_ui_type(preinfOn_param, ESP_RMAKER_UI_SLIDER);
     esp_rmaker_param_add_bounds(preinfOn_param, esp_rmaker_int(2), esp_rmaker_int(10), esp_rmaker_int(1));
     esp_rmaker_device_add_param(espresso_device, preinfOn_param);
 
     /* Pre-Infusion Off Time slider object */
-    esp_rmaker_param_t *preinfOff_param = esp_rmaker_param_create("Pre-Infusion Off Time", NULL, esp_rmaker_int(preInfOffTime), PROP_FLAG_READ | PROP_FLAG_WRITE);
+    esp_rmaker_param_t *preinfOff_param = esp_rmaker_param_create("Pre-Infusion off time (s)", NULL,
+                                                                   esp_rmaker_int(preInfOffTime), PROP_FLAG_READ | PROP_FLAG_WRITE);
     esp_rmaker_param_add_ui_type(preinfOff_param, ESP_RMAKER_UI_SLIDER);
     esp_rmaker_param_add_bounds(preinfOff_param, esp_rmaker_int(2), esp_rmaker_int(30), esp_rmaker_int(1));
     esp_rmaker_device_add_param(espresso_device, preinfOff_param);
+
+#if OVERSHOOT_DETECT_ENABLE
+    /* Build initial string from loaded NVS trim (nvsRead ran earlier). */
+    overshoot_disp_format_str();
+    /* Stored cumulative trim (%). While an excursion is latched, appends live peak in °C. */
+    overshoot_disp_param = esp_rmaker_param_create("Warmup power trim", NULL, esp_rmaker_str(s_overshoot_disp_str),
+                                                   PROP_FLAG_READ);
+    esp_rmaker_param_add_ui_type(overshoot_disp_param, ESP_RMAKER_UI_TEXT);
+    esp_rmaker_device_add_param(espresso_device, overshoot_disp_param);
+
+    esp_rmaker_param_t *reset_os_param = esp_rmaker_param_create("Reset power trim", NULL, esp_rmaker_bool(false),
+                                                                 PROP_FLAG_READ | PROP_FLAG_WRITE);
+    esp_rmaker_param_add_ui_type(reset_os_param, ESP_RMAKER_UI_TRIGGER);
+    esp_rmaker_device_add_param(espresso_device, reset_os_param);
+
+#endif
+
+    snprintf(s_status_str, sizeof(s_status_str), "Okay");
+    status_param = esp_rmaker_param_create("Status", NULL, esp_rmaker_str(s_status_str), PROP_FLAG_READ);
+    esp_rmaker_param_add_ui_type(status_param, ESP_RMAKER_UI_TEXT);
+    esp_rmaker_device_add_param(espresso_device, status_param);
 
     /* Enable OTA */
     esp_rmaker_ota_enable_default();
@@ -582,7 +1151,7 @@ void app_main()
     /* Start the ESP RainMaker Agent */
     esp_rmaker_start();
 
-    err = app_wifi_set_custom_mfg_data(MGF_DATA_DEVICE_TYPE_SWITCH, MFG_DATA_DEVICE_SUBTYPE_SWITCH);
+    err = app_wifi_set_custom_mfg_data(MFG_DATA_DEVICE_TYPE_SWITCH, MFG_DATA_DEVICE_SUBTYPE_SWITCH);
     
     /* Start the Wi-Fi.
      * If the node is provisioned, it will start connection attempts,
@@ -597,15 +1166,13 @@ void app_main()
         abort();
     }
 
-    gpioConfig();
-    
     /* Init SPI driver */
     spi = spi_init();
 
     /* PID Controller init */
-    #if (CONTROL_TYPE == PID) || (CONTROL_TYPE == PID_LOOKUP)
+#if (CONTROL_TYPE == PID) || (CONTROL_TYPE == PID_LOOKUP)
     pidInit();
-    #endif
+#endif
 
     /* initialize heating element control (dimmer) */
     dimInit();
@@ -676,39 +1243,53 @@ void Task500ms(void)
 
 void heatingControl(void)
 {
-    #if (CONTROL_TYPE == PID)
+#if (CONTROL_TYPE == PID)
 
         pidOut = pidUpdate((float)tempSetpoint, tempCelsius);
         control = (int)pidOut;
 
-    #elif (CONTROL_TYPE == LOOKUP)
-        
+#elif (CONTROL_TYPE == LOOKUP)
+
         delta = ((float)tempSetpoint - tempCelsius);
 
         float ir = indexRatio(deltaBkp, BKP_NUM, delta);
-        control = (int)interp1D(controlSet, BKP_NUM, ir);
-        
+        const int control_lookup = (int)interp1D(controlSet, BKP_NUM, ir);
+#if OVERSHOOT_DETECT_ENABLE
+        if (temp_read_trusted) {
+            if (!overshoot_boot_temp_sampled) {
+                overshoot_boot_temp_sampled = true;
+                overshoot_learn_try_arm_cold("boot trusted");
+            }
+            overshoot_peak_detector_update();
+        }
+        int control_after_trim = control_lookup;
+        overshoot_apply_trim_to_control(&control_after_trim);
+        control = control_after_trim;
+#else
+        control = control_lookup;
+#endif
+
+        /* reduce power to a factor by toggling power each task */
         if ((delta > 0) && (delta <= TEMP_PWR_TOGGLE))
         {
-            /* reduce power to a factor by toggling power each task */
             powerToggle = (int)((count500ms % POWER_FACTOR) == 0);
             control = (control * powerToggle);
         }
 
-    #elif (CONTROL_TYPE == PID_LOOKUP)
+#elif (CONTROL_TYPE == PID_LOOKUP)
 
         pidOut = pidUpdate((float)tempSetpoint, tempCelsius);
 
         float ir = indexRatio(deltaBkp, BKP_NUM, pidOut);
         control = (int)interp1D(controlSet, BKP_NUM, ir);
 
-    #endif
+#endif
 
-    if ((tempCelsius == 0) || (tempCelsius > MAX_TEMP_THR))
-    {
-        /* switch off heating element when temperature sensor is disconnected or in overheat condition */
+    temp_stuck_diag_update(control);
+
+    if (boiler_heater_holdoff()) {
         control = 0;
-        ESP_LOGE(TAG, "Recovery mode, overheat detected or temperature sensor failed!");
+        ESP_LOGW(TAG, "Boiler heater held off: unsafe read, range, or stuck-temp diag.");
     }
     else if (brewState == BREW_POWER_OFF)
     {
@@ -718,18 +1299,24 @@ void heatingControl(void)
     else
     {
         /*
-         * Set full power while water pump is ON for to keep temperature stable.
-         * To better buffer temperature after starting pre-infusion, we'll leave heating element ON for
-         * half the time of preinfusion ON at the start of pre-infusion OFF.
+         * Full heat offsets cold-water dip only while temp < setpoint + TEMP_DELTA.
+         * Preinfusion OFF: full heat for first half of preinfusion ON time (pump off).
+         * Flush: full heat for first half of flush only; pump runs full FLUSH_PUMP_SEC in brewProgram.
          */
 
-        #define TIME_TEMP_BUFF  (unsigned long long)SEC_TO_US((float)preInfOnTime / 2)
+        const bool pump_phase_full_heat =
+            (brewState == BREW_PREINF_ON) || (brewState == BREW_ON) ||
+            ((brewState == BREW_FLUSH) && ((getAbsTime1us() - pumpTimer) < TIME_FLUSH_HEAT_BUFF_US)) ||
+            ((brewState == BREW_PREINF_OFF) && ((getAbsTime1us() - pumpTimer) < TIME_TEMP_BUFF_US));
+        const float temp_full_heat_max = (float)tempSetpoint + (float)TEMP_DELTA;
 
-        control = ((brewState == BREW_PREINF_ON) || (brewState == BREW_ON) ||
-                    ((brewState == BREW_PREINF_OFF) && ((getAbsTime1us() - pumpTimer) < TIME_TEMP_BUFF))) ? (int)100 : control;
+        if (pump_phase_full_heat && (tempCelsius < temp_full_heat_max)) {
+            control = 100;
+        }
     }
 
     setPower(ptr_dimmer, (int)control);
+
 
     ESP_LOGI(TAG, "%d | %.2f | %.2f | %d | %d", tempSetpoint, tempCelsius, pidOut, control, getPower(ptr_dimmer));
 }
@@ -739,8 +1326,11 @@ void Task5000ms(void)
     if (powerOn)
     {
         /* only report data to app when device is on, to save MQTT budget */
-        esp_rmaker_param_update_and_report(primary, esp_rmaker_float(tempCelsius));
-        esp_rmaker_param_update_and_report(tempOk_param, esp_rmaker_bool(tempRangeOk));
+        temp_status_line_report();
+        boiler_status_report();
+#if OVERSHOOT_DETECT_ENABLE
+        overshoot_disp_report();
+#endif
     }
 }
 
@@ -751,7 +1341,9 @@ void brewProgram(void)
      * brewing attempt if temperature is not within an acceptable range (calibrated
      * by TEMP_DELTA).
      */
-    if ((tempCelsius < (tempSetpoint - TEMP_DELTA)) || (tempCelsius > (tempSetpoint + TEMP_DELTA)))
+    if (!temp_read_trusted || temp_stuck_diag) {
+        tempRangeOk = false;
+    } else if ((tempCelsius < (tempSetpoint - TEMP_DELTA)) || (tempCelsius > (tempSetpoint + TEMP_DELTA)))
     {
         tempRangeOk = false;
     }
@@ -760,12 +1352,19 @@ void brewProgram(void)
         tempRangeOk = true;
     }
 
-    /* A brewing operation is stopped if user presses Brew Signal again */
-    if ((brewSignal == false) && (brewState != BREW_POWER_OFF))
-    {
-        /* abort brew at any stage */
-        gpio_set_level(GPIO_OUTPUT_IO_0, 0);
-        brewState = BREW_OFF;
+    /* Stop pump: power off; or user cleared Brew during brew; or cleared Flush during flush. */
+    if (brewState != BREW_POWER_OFF) {
+        const bool stop_brew = !brewSignal &&
+                               (brewState == BREW_PREINF_ON || brewState == BREW_PREINF_OFF ||
+                                brewState == BREW_ON);
+        const bool stop_flush = !flushSignal && brewState == BREW_FLUSH;
+
+        if (!powerOn || stop_brew || stop_flush) {
+            gpio_set_level(GPIO_OUTPUT_IO_0, 0);
+            brewSignal = false;
+            flushSignal = false;
+            brewState = BREW_OFF;
+        }
     }
 
     /*
@@ -798,7 +1397,15 @@ void brewProgram(void)
                     /* abort brew attempt and reset button */
                     ESP_LOGI(TAG, "Brew aborted! Setpoint temperature not reached");
                     brewSignal = false;
+                    flushSignal = false;
                 }
+            }
+            else if (flushSignal == true)
+            {
+                pumpTimer = getAbsTime1us();
+                brewState = BREW_FLUSH;
+                powerOnTimer = getAbsTime1us();
+                ESP_LOGI(TAG, "Flush started");
             }
             else
             {
@@ -809,6 +1416,9 @@ void brewProgram(void)
                     brewState = BREW_POWER_OFF;
 
                     powerOn = false;
+#if OVERSHOOT_DETECT_ENABLE
+                    overshoot_learn_ever_armed = false;
+#endif
                     esp_rmaker_param_update_and_report(poweron_param, esp_rmaker_bool(powerOn));
 
                     ESP_LOGI(TAG, "Switching power OFF!");
@@ -860,7 +1470,8 @@ void brewProgram(void)
 
                 ESP_LOGI(TAG, "Brew cycle completed!");
                 brewSignal = false;     /* reset for next press */
-                
+                flushSignal = false;
+
                 /* Save brewing parameters to NVS */
                 nvsWrite();
             } 
@@ -869,13 +1480,32 @@ void brewProgram(void)
 
         case BREW_POWER_OFF:
 
-            /* Standby mode. Leaving here only if Power switch is toggled */
+            /* Standby: leaving on Power on — reset latches so a clean idle is guaranteed. */
             if (powerOn == true)
             {
                 powerOnTimer = getAbsTime1us();
                 brewState = BREW_OFF;
+                brewSignal = false;
+                flushSignal = false;
+#if OVERSHOOT_DETECT_ENABLE
+                overshoot_learn_try_arm_cold("standby->on");
+#endif
 
                 ESP_LOGI(TAG, "Switching power ON!");
+            }
+
+        break;
+
+        case BREW_FLUSH:
+
+            if ((getAbsTime1us() - pumpTimer) < SEC_TO_US(FLUSH_PUMP_SEC)) {
+                gpio_set_level(GPIO_OUTPUT_IO_0, 1);
+            } else {
+                gpio_set_level(GPIO_OUTPUT_IO_0, 0);
+                brewState = BREW_OFF;
+                brewSignal = false;
+                flushSignal = false;
+                ESP_LOGI(TAG, "Flush completed");
             }
 
         break;

@@ -8,7 +8,6 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "driver/gpio.h"
-#include "driver/periph_ctrl.h"
 #include "driver/gptimer.h"
 #include "freertos/task.h"
 #include "math.h"
@@ -79,9 +78,6 @@ void toggleSettings(dimmertyp *ptr, int minValue, int maxValue);
 void port_init(dimmertyp *ptr);
 void config_timer(int freq);
 void ext_int_init(dimmertyp *ptr);
-
-static void IRAM_ATTR isr_ext(void* arg);
-static void IRAM_ATTR onTimerISR(void* arg);
 
 extern unsigned long long getAbsTime1us(void);
 

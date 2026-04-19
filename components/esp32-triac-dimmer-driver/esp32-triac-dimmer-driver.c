@@ -1,6 +1,9 @@
 
 #include "esp32-triac-dimmer-driver.h"
 
+static void isr_ext(void *arg);
+static bool onTimerISR(gptimer_handle_t timer, const gptimer_alarm_event_data_t *edata, void *user_ctx);
+
 static const char *TAG = "Esp32idfDimmer";
 
 int pulseWidth = 4;
@@ -15,8 +18,6 @@ static int toggleCounter = 0;
 static int toggleReload = 25;
 volatile bool _initDone = false;
 volatile int _steps = 0;
-
-static unsigned long long lastEdgeTime = 0;
 
 static dimmertyp *dimmer[ALL_DIMMERS];
 volatile bool firstSetup = false;
@@ -62,13 +63,13 @@ dimmertyp *createDimmer(gpio_num_t user_dimmer_pin, gpio_num_t zc_dimmer_pin)
 	return dimmer[current_dim - 1];
 }
 
-#define TIMER_BASE_CLK 1 * 1000 * 1000,              // 1MHz, 1 tick = 1us
+#define TIMER_BASE_CLK (1000000u) /* 1 MHz, 1 tick = 1 us */
 
 /**
  * @brief Configure the timer alarm
  */
-void config_alarm(gptimer_handle_t *timer, int ACfreq) 
-{   
+void config_alarm(gptimer_handle_t timer, int ACfreq)
+{
     /*self regulation 50/60 Hz*/
 	double m_calculated_interval = (1 / (double)(ACfreq * 2)) / 100;
     ESP_LOGI(TAG, "Interval between wave calculated for frequency : %3dHz = %5f", ACfreq, m_calculated_interval);
@@ -81,13 +82,13 @@ void config_alarm(gptimer_handle_t *timer, int ACfreq)
     .flags.auto_reload_on_alarm = true, // enable auto-reload
     };
     ESP_LOGI(TAG, "Timer configuration - set alarm action");
-    ESP_ERROR_CHECK(gptimer_set_alarm_action(gptimer, &alarm_config));
+    ESP_ERROR_CHECK(gptimer_set_alarm_action(timer, &alarm_config));
 
     gptimer_event_callbacks_t cbs = {
     .on_alarm = onTimerISR, // register user callback
     };
     ESP_LOGI(TAG, "Timer configuration - register event callbacks");
-    ESP_ERROR_CHECK(gptimer_register_event_callbacks(gptimer, &cbs, NULL));
+    ESP_ERROR_CHECK(gptimer_register_event_callbacks(timer, &cbs, NULL));
 
     ESP_LOGI(TAG, "Timer configuration - configuration completed");
 }
@@ -155,6 +156,7 @@ void ext_int_init(dimmertyp *ptr)
 	ESP_LOGI(TAG, "Triac command configuration");
 
 	gpio_set_direction(dimOutPin[ptr->current_num], GPIO_MODE_OUTPUT);
+	gpio_set_level(dimOutPin[ptr->current_num], 0);
 	ESP_LOGI(TAG, "Triac command configuration - completed");
 }
 
@@ -324,14 +326,19 @@ static int k;
 #if DEBUG_ISR_TIMER == ISR_DEBUG_ON
 static int counter = 0;
 #endif
-/* Execution on timer event */
-static void IRAM_ATTR onTimerISR(void *para)
+/* Execution on timer event (GPTimer ISR contract: IDF 5.x+) */
+static bool IRAM_ATTR onTimerISR(gptimer_handle_t timer, const gptimer_alarm_event_data_t *edata, void *user_ctx)
 {
+    (void)timer;
+    (void)edata;
+    (void)user_ctx;
+    BaseType_t hp_task_awoken = pdFALSE;
+
 /**********************************/
 #if DEBUG_ISR_TIMER == ISR_DEBUG_ON
 	counter++;
 	uint32_t info = (uint32_t)counter;
-	xQueueSendFromISR(timer_event_queue, &info, NULL);
+	xQueueSendFromISR(timer_event_queue, &info, &hp_task_awoken);
 #endif
 
 	toggleCounter++;
@@ -391,4 +398,6 @@ static void IRAM_ATTR onTimerISR(void *para)
 	}
 	if (toggleCounter >= toggleReload)
 		toggleCounter = 1;
+
+    return hp_task_awoken == pdTRUE;
 }
