@@ -8,9 +8,9 @@ else()
   set(RMAKER_PATH ${CMAKE_CURRENT_LIST_DIR}/../..)
 endif(DEFINED ENV{RMAKER_PATH})
 
-# Add RainMaker components and other common application components
-set(EXTRA_COMPONENT_DIRS ${RMAKER_PATH}/components/esp-insights/components ${RMAKER_PATH}/components ${RMAKER_PATH}/examples/common ${CMAKE_CURRENT_LIST_DIR}/components)
+# RainMaker components + example helpers (app_wifi, app_insights, …)
+set(EXTRA_COMPONENT_DIRS ${RMAKER_PATH}/components ${RMAKER_PATH}/examples/common ${CMAKE_CURRENT_LIST_DIR}/components)
 
-set(PROJECT_VER "1.0")
+set(PROJECT_VER "1.8.3")
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
-project(switch)
+project(espresso)

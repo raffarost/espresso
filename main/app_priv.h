@@ -17,3 +17,8 @@ void gpioConfig(void);
 extern float indexRatio(float vector[], int size, float input);
 extern float interp1D(float vector[], int size, float ir);
 extern unsigned long long getAbsTime1us(void);
+
+/** Boiler MAX6675 path: true after several consecutive good samples; false on any SPI/open/range fault. */
+bool boiler_temp_is_trusted(void);
+/** Latched fault bits (TEMP_DIAG_*); cleared when read becomes fully trusted again. */
+uint32_t boiler_temp_fault_bits(void);

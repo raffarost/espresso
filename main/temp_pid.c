@@ -23,7 +23,8 @@ PIDController pid = { PID_KP, PID_KI, PID_KD,
                         PID_TAU,
                         PID_LIM_MIN, PID_LIM_MAX,
                         PID_LIM_MIN_INT, PID_LIM_MAX_INT,
-                        SAMPLE_TIME_S };
+                        SAMPLE_TIME_S,
+                        0, 0, 0, 0, 0 };
 
 void pidInit(void)
 {
