@@ -108,8 +108,8 @@ To calibrate the PID controller, the following symbols can be optimized for each
 To calibrate the P controller, the following vectors can be changed:
 
 ```
-static float   deltaBkp[BKP_NUM] = {-10,  0, 0.5,  1,  2,  4, 10,  25,  50, 100};
-static float controlSet[BKP_NUM] = {  0,  0,   1,  1,  1,  1,  1,  80, 100, 100};
+static float   deltaBkp[BKP_NUM] = {-10,  0, 0.5,  1,  2,  4, 10,  25,  50,  70};
+static float controlSet[BKP_NUM] = {  0,  0,   1,  1,  1,  1,  1,  25,  60, 100};
 ```
 
 The first vector corresponds to the temperature difference between target and actual reading.

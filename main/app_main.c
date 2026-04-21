@@ -103,8 +103,8 @@ if (ret != ESP_OK)  \
 
 #define BKP_NUM       10
 
-static float   deltaBkp[BKP_NUM] = {-10,  0, 0.5,  1,  2,  4, 10,  25,  50, 100};  /* temperature delta */
-static float controlSet[BKP_NUM] = {  0,  0,   1,  1,  1,  1,  1,  80, 100, 100};  /* power setpoint in percentage */
+static float   deltaBkp[BKP_NUM] = {-10,  0, 0.5,  1,  2,  4, 10,  25,  50,  70};  /* temperature delta */
+static float controlSet[BKP_NUM] = {  0,  0,   1,  1,  1,  1,  1,  25,  60, 100};  /* power setpoint in percentage */
 
 #define SEC_TO_US(x)        (x * 1000000)
 
