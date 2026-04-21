@@ -101,7 +101,6 @@ if (ret != ESP_OK)  \
 #define OVERSHOOT_DETECT_ENABLE  1
 #endif
 
-
 #define BKP_NUM       10
 
 static float   deltaBkp[BKP_NUM] = {-10,  0, 0.5,  1,  2,  4, 10,  25,  50, 100};  /* temperature delta */
@@ -116,10 +115,13 @@ static float controlSet[BKP_NUM] = {  0,  0,   1,  1,  1,  1,  1,  80, 100, 100}
 #define BREW_POWER_OFF      4
 #define BREW_FLUSH          5
 
-#define FLUSH_PUMP_SEC      5   /* group-head flush: pump on duration */
-/* Pump-phase full-heat windows (us); preInfOnTime may change at runtime (RainMaker). */
-#define TIME_TEMP_BUFF_US        ((unsigned long long)SEC_TO_US((float)preInfOnTime / 2.f))
-#define TIME_FLUSH_HEAT_BUFF_US  ((unsigned long long)SEC_TO_US((float)FLUSH_PUMP_SEC / 2.f))
+#define PUMP_ON_HEAT_BUFF_LEN  20  /* must be >= max brew time (s) and max flush time (s) */
+
+/* Each BKP is seconds of pump-on time; output is heater power (%). */
+static int pumpOnHeatBuff[PUMP_ON_HEAT_BUFF_LEN] = {
+/*  s:   0    1    2    3    4    5    6    7    8    9   10   11   12   13   14   15   16   17   18   19 */
+       100, 100,  80,  80,  70,  70,  70,  70,  70,  70,  70,  70,  70,  70,  70,  70,  70,  70,  70,  70
+};
 
 #define TEMP_DELTA          2   /* temp delta from setpoint for good brewing temperature */
 #define TEMP_SETPOINT_MIN   88
@@ -202,6 +204,8 @@ static float delta;
 static int control;
 static int powerToggle = 0;
 static unsigned long long pumpTimer = 0;
+static bool pump_active;
+static unsigned long long pump_start_us;
 static unsigned long long powerOnTimer = 0;
 static bool brewSignal = false;
 static bool flushSignal = false;
@@ -213,6 +217,7 @@ static bool powerOn = false;
 static bool preInfusion = true;
 static int32_t preInfOnTime = 3;
 static int32_t preInfOffTime = 10;
+static int32_t flushTime = 5;
 
 static bool temp_read_trusted;
 static uint8_t temp_read_good_streak;
@@ -303,6 +308,12 @@ static esp_err_t write_cb(const esp_rmaker_device_t *device, const esp_rmaker_pa
     {
         brewTime = val.val.i;
         ESP_LOGI(TAG, "Brew Time: %d s", brewTime);
+    }
+
+    if (strcmp(esp_rmaker_param_get_name(param), "Flush time (s)") == 0)
+    {
+        flushTime = val.val.i;
+        ESP_LOGI(TAG, "Flush Time: %d s", flushTime);
     }
 
     if (strcmp(esp_rmaker_param_get_name(param), "Brew Signal") == 0)
@@ -516,6 +527,7 @@ void nvsRead(void)
             tempSetpoint = TEMP_SETPOINT_MAX;
         }
         nvs_get_i32(nvs_handle, "brewTime", &brewTime);
+        nvs_get_i32(nvs_handle, "flushTime", &flushTime);
         nvs_get_u8(nvs_handle, "preInfusion", &u8);
         preInfusion = u8 != 0;
         nvs_get_i32(nvs_handle, "preInfOnTime", &preInfOnTime);
@@ -546,6 +558,7 @@ void nvsWrite(void)
         ESP_ERROR_CHECK(nvs_set_u8(nvs_handle, "tempLock", (uint8_t)tempLock));
         ESP_ERROR_CHECK(nvs_set_i32(nvs_handle, "tempSetpoint", tempSetpoint));
         ESP_ERROR_CHECK(nvs_set_i32(nvs_handle, "brewTime", brewTime));
+        ESP_ERROR_CHECK(nvs_set_i32(nvs_handle, "flushTime", flushTime));
         ESP_ERROR_CHECK(nvs_set_u8(nvs_handle, "preInfusion", (uint8_t)preInfusion));
         ESP_ERROR_CHECK(nvs_set_i32(nvs_handle, "preInfOnTime", preInfOnTime));
         ESP_ERROR_CHECK(nvs_set_i32(nvs_handle, "preInfOffTime", preInfOffTime));
@@ -1088,7 +1101,7 @@ void app_main()
     esp_rmaker_param_add_ui_type(brewtime_param, ESP_RMAKER_UI_SLIDER);
     esp_rmaker_param_add_bounds(brewtime_param, esp_rmaker_int(6), esp_rmaker_int(20), esp_rmaker_int(1));
     esp_rmaker_device_add_param(espresso_device, brewtime_param);
-  
+
     /* Creating Pre-Infusion toggle switch */
     esp_rmaker_param_t *preinf_param = esp_rmaker_param_create("Pre-Infusion", NULL, esp_rmaker_bool(preInfusion), PROP_FLAG_READ | PROP_FLAG_WRITE);
     esp_rmaker_param_add_ui_type(preinf_param, ESP_RMAKER_UI_TOGGLE);
@@ -1107,6 +1120,12 @@ void app_main()
     esp_rmaker_param_add_ui_type(preinfOff_param, ESP_RMAKER_UI_SLIDER);
     esp_rmaker_param_add_bounds(preinfOff_param, esp_rmaker_int(2), esp_rmaker_int(30), esp_rmaker_int(1));
     esp_rmaker_device_add_param(espresso_device, preinfOff_param);
+
+    esp_rmaker_param_t *flushtime_param = esp_rmaker_param_create("Flush time (s)", NULL, esp_rmaker_int(flushTime),
+                                                                   PROP_FLAG_READ | PROP_FLAG_WRITE);
+    esp_rmaker_param_add_ui_type(flushtime_param, ESP_RMAKER_UI_SLIDER);
+    esp_rmaker_param_add_bounds(flushtime_param, esp_rmaker_int(3), esp_rmaker_int(20), esp_rmaker_int(1));
+    esp_rmaker_device_add_param(espresso_device, flushtime_param);
 
 #if OVERSHOOT_DETECT_ENABLE
     /* Build initial string from loaded NVS trim (nvsRead ran earlier). */
@@ -1255,7 +1274,7 @@ void heatingControl(void)
         float ir = indexRatio(deltaBkp, BKP_NUM, delta);
         const int control_lookup = (int)interp1D(controlSet, BKP_NUM, ir);
 #if OVERSHOOT_DETECT_ENABLE
-        if (temp_read_trusted) {
+        if (temp_read_trusted && !pump_active) {
             if (!overshoot_boot_temp_sampled) {
                 overshoot_boot_temp_sampled = true;
                 overshoot_learn_try_arm_cold("boot trusted");
@@ -1269,8 +1288,8 @@ void heatingControl(void)
         control = control_lookup;
 #endif
 
-        /* reduce power to a factor by toggling power each task */
-        if ((delta > 0) && (delta <= TEMP_PWR_TOGGLE))
+        /* reduce power to a factor by toggling power each task (idle only) */
+        if (!pump_active && (delta > 0) && (delta <= TEMP_PWR_TOGGLE))
         {
             powerToggle = (int)((count500ms % POWER_FACTOR) == 0);
             control = (control * powerToggle);
@@ -1285,7 +1304,9 @@ void heatingControl(void)
 
 #endif
 
-    temp_stuck_diag_update(control);
+    if (!pump_active) {
+        temp_stuck_diag_update(control);
+    }
 
     if (boiler_heater_holdoff()) {
         control = 0;
@@ -1296,23 +1317,10 @@ void heatingControl(void)
         /* switch off heating element and remain in standby */
         control = 0;
     }
-    else
+    else if (pump_active)
     {
-        /*
-         * Full heat offsets cold-water dip only while temp < setpoint + TEMP_DELTA.
-         * Preinfusion OFF: full heat for first half of preinfusion ON time (pump off).
-         * Flush: full heat for first half of flush only; pump runs full FLUSH_PUMP_SEC in brewProgram.
-         */
-
-        const bool pump_phase_full_heat =
-            (brewState == BREW_PREINF_ON) || (brewState == BREW_ON) ||
-            ((brewState == BREW_FLUSH) && ((getAbsTime1us() - pumpTimer) < TIME_FLUSH_HEAT_BUFF_US)) ||
-            ((brewState == BREW_PREINF_OFF) && ((getAbsTime1us() - pumpTimer) < TIME_TEMP_BUFF_US));
-        const float temp_full_heat_max = (float)tempSetpoint + (float)TEMP_DELTA;
-
-        if (pump_phase_full_heat && (tempCelsius < temp_full_heat_max)) {
-            control = 100;
-        }
+        unsigned s = (unsigned)((getAbsTime1us() - pump_start_us) / 1000000ULL);
+        control = pumpOnHeatBuff[s];
     }
 
     setPower(ptr_dimmer, (int)control);
@@ -1361,6 +1369,7 @@ void brewProgram(void)
 
         if (!powerOn || stop_brew || stop_flush) {
             gpio_set_level(GPIO_OUTPUT_IO_0, 0);
+            pump_active = false;
             brewSignal = false;
             flushSignal = false;
             brewState = BREW_OFF;
@@ -1379,7 +1388,7 @@ void brewProgram(void)
                 if ((tempRangeOk) || (tempLock == false))
                 {
                     pumpTimer = getAbsTime1us();
-                    
+
                     if (preInfusion)
                     {
                         brewState = BREW_PREINF_ON;
@@ -1388,7 +1397,9 @@ void brewProgram(void)
                     {
                         brewState = BREW_ON;
                     }
-                    
+                    pump_active = true;
+                    pump_start_us = pumpTimer;
+
                     /* reset power on timer */
                     powerOnTimer = getAbsTime1us();
                 }
@@ -1404,6 +1415,8 @@ void brewProgram(void)
             {
                 pumpTimer = getAbsTime1us();
                 brewState = BREW_FLUSH;
+                pump_active = true;
+                pump_start_us = pumpTimer;
                 powerOnTimer = getAbsTime1us();
                 ESP_LOGI(TAG, "Flush started");
             }
@@ -1436,8 +1449,9 @@ void brewProgram(void)
             else
             {
                 brewState = BREW_PREINF_OFF;
+                pump_active = false;
                 pumpTimer = getAbsTime1us();
-            }           
+            }
 
         break;
 
@@ -1452,7 +1466,9 @@ void brewProgram(void)
             {
                 brewState = BREW_ON;
                 pumpTimer = getAbsTime1us();
-            } 
+                pump_active = true;
+                pump_start_us = pumpTimer;
+            }
 
         break;
 
@@ -1466,6 +1482,7 @@ void brewProgram(void)
             else
             {
                 gpio_set_level(GPIO_OUTPUT_IO_0, 0);
+                pump_active = false;
                 brewState = BREW_OFF;
 
                 ESP_LOGI(TAG, "Brew cycle completed!");
@@ -1474,7 +1491,7 @@ void brewProgram(void)
 
                 /* Save brewing parameters to NVS */
                 nvsWrite();
-            } 
+            }
 
         break;
 
@@ -1498,10 +1515,11 @@ void brewProgram(void)
 
         case BREW_FLUSH:
 
-            if ((getAbsTime1us() - pumpTimer) < SEC_TO_US(FLUSH_PUMP_SEC)) {
+            if ((getAbsTime1us() - pumpTimer) < SEC_TO_US(flushTime)) {
                 gpio_set_level(GPIO_OUTPUT_IO_0, 1);
             } else {
                 gpio_set_level(GPIO_OUTPUT_IO_0, 0);
+                pump_active = false;
                 brewState = BREW_OFF;
                 brewSignal = false;
                 flushSignal = false;

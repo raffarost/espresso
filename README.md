@@ -114,3 +114,23 @@ static float controlSet[BKP_NUM] = {  0,  0,   1,  1,  1,  1,  1,  80, 100, 100}
 
 The first vector corresponds to the temperature difference between target and actual reading.
 The second vector is the power factor (0 to 100%) to apply for each (interpolated) delta.
+
+#### Pump heat buffer calibration
+
+When the pump is active (pre-infusion, brew, or flush), cold water entering the boiler causes a
+temperature drop. To compensate, a time-indexed power profile is applied instead of the idle
+temperature controller:
+
+```
+static int pumpOnHeatBuff[PUMP_ON_HEAT_BUFF_LEN] = {
+    80, 80, 60, 60, 40, 40, 40, ...
+};
+```
+
+Each entry is the heater power (0–100%) applied at the corresponding second of pump-on time.
+Index 0 is the first second, index 1 the second, and so on up to `PUMP_ON_HEAT_BUFF_LEN - 1`.
+The vector length must be at least as long as the maximum configured brew time and flush time.
+
+The default calibration likely needs to be tuned for each machine, also considering the position the
+temperature sensor is located for the particular project. The recommended calibration procedure is to
+use the **Flush** button to experimentally calibrate the vector.
