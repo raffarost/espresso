@@ -11,6 +11,6 @@ endif(DEFINED ENV{RMAKER_PATH})
 # RainMaker components + example helpers (app_wifi, app_insights, …)
 set(EXTRA_COMPONENT_DIRS ${RMAKER_PATH}/components ${RMAKER_PATH}/examples/common ${CMAKE_CURRENT_LIST_DIR}/components)
 
-set(PROJECT_VER "1.9.0")
+set(PROJECT_VER "2.0.1")
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(espresso)

@@ -4,7 +4,7 @@
 #
 
 PROJECT_NAME := espresso
-PROJECT_VER := 1.9.0
+PROJECT_VER := 2.0.1
 
 # Add RainMaker components and other common application components
 EXTRA_COMPONENT_DIRS += $(PROJECT_PATH)/../../components $(PROJECT_PATH)/../common

@@ -108,8 +108,8 @@ To calibrate the PID controller, the following symbols can be optimized for each
 To calibrate the P controller, the following vectors can be changed:
 
 ```
-static float   deltaBkp[BKP_NUM] = {-10,  0, 0.5,  1,  2,  4, 10,  25,  50,  70};
-static float controlSet[BKP_NUM] = {  0,  0,   1,  1,  1,  1,  1,  25,  60, 100};
+static float   deltaBkp[BKP_NUM] = {-10,  0, 0.5,  1,  2,  4,  10,  25,  50,  70};
+static float controlSet[BKP_NUM] = {  0,  0,   1,  1,  1,  2,  15,  30,  60,  80};
 ```
 
 The first vector corresponds to the temperature difference between target and actual reading.
@@ -123,7 +123,7 @@ temperature controller:
 
 ```
 static int pumpOnHeatBuff[PUMP_ON_HEAT_BUFF_LEN] = {
-    80, 80, 60, 60, 40, 40, 40, ...
+    100, 100, 100, 100,  80,  80,  40,  40,  30,  30,  30,  40,  40,  40,  40,  60,  60,  60,  60,  60
 };
 ```
 
@@ -131,6 +131,13 @@ Each entry is the heater power (0–100%) applied at the corresponding second of
 Index 0 is the first second, index 1 the second, and so on up to `PUMP_ON_HEAT_BUFF_LEN - 1`.
 The vector length must be at least as long as the maximum configured brew time and flush time.
 
-The default calibration likely needs to be tuned for each machine, also considering the position the
-temperature sensor is located for the particular project. The recommended calibration procedure is to
-use the **Flush** button to experimentally calibrate the vector.
+##### Extraction flow dynamics
+
+The power profile follows the natural resistance the coffee puck offers to water flow during extraction:
+
+- **Phase 1 (~4 s)** — Free-flow: water saturates the dry puck with little resistance. Flow rate is high and the boiler cools quickly, so high heater power is needed.
+- **Phase 2 (~4 s)** — Puck compressing: swelling grounds start restricting flow. Less water moves through, so less compensation is required.
+- **Phase 3 (~6 s)** — Maximum compression: the puck is fully saturated and tightly packed. Flow is most restricted and the boiler loses less heat, so power demand is at its lowest.
+- **Phase 4 (~6 s+)** — Puck deterioration: channels begin to form as the grounds break down, flow gradually recovers, and power demand rises again.
+
+This is a general profile — it can vary significantly depending on basket type (single vs. double) and dimensions, coffee dose, grind size, and temperature sensor position within the machine.
