@@ -50,8 +50,8 @@
  * Overshoot NVS encoding helpers (also used by nvs.c)
  *****************************************************************************/
 #if OVERSHOOT_DETECT_ENABLE
-#define OVERSHOOT_TRIM_FRAC_MAX             0.20f
-#define OVERSHOOT_TRIM_FRAC_PER_DEG         0.04f
+#define OVERSHOOT_TRIM_FRAC_MAX             0.50f
+#define OVERSHOOT_TRIM_FRAC_PER_DEG         0.10f
 #define OVERSHOOT_TRIM_FRAC_TO_MPCT(f)      ((int32_t)lroundf((f) * 100000.0f))
 #define OVERSHOOT_TRIM_MPCT_TO_FRAC(i)      ((float)(i) * 0.00001f)
 #endif

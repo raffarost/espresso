@@ -65,14 +65,18 @@ static const char *TAG = "espresso";
 #define STUCK_DIAG_CLEAR_MAX_C      110.f
 #define STUCK_DIAG_WARMUP_GRACE_SEC 10.f
 
-/* Power dithering around setpoint */
-#define POWER_50        2
-#define POWER_33        3
-#define POWER_25        4
-#define POWER_FACTOR    POWER_50
-#define TEMP_PWR_TOGGLE 2   /* °C window where power is dithered */
+/* Minimum safe driver value — see controlSet[] comment for the gate-overflow rationale */
+#define CONTROL_MIN_NONZERO     5
 
-#define POWERON_MIN     (15 * SEC_TO_US(60))    /* standby timeout (15 min) */
+/* Power dithering around setpoint (set PWR_TOGGLE_ENABLE to 1 to activate) */
+#define PWR_TOGGLE_ENABLE   1
+#define POWER_50            2    /* 50 % */
+#define POWER_33            3    /* 33 % */
+#define POWER_25            4    /* 25 % */
+#define POWER_FACTOR        POWER_33
+#define DELTA_PWR_TOGGLE    10   /* delta °C window where power is dithered */
+
+#define POWERON_MIN         (15 * SEC_TO_US(60))    /* standby timeout (15 min) */
 
 /* Status severity priorities */
 #define STATUS_PRI_ZERO         25
@@ -82,20 +86,25 @@ static const char *TAG = "espresso";
 #define STATUS_WORST_CLEAR_OK_REPORTS   12  /* Task5000ms ticks (~60 s) */
 
 #if OVERSHOOT_DETECT_ENABLE
-#define OVERSHOOT_SOFT_DISARM_SEC               90.f
-#define OVERSHOOT_TRIM_DEMAND_PCT_THRESHOLD     30.0f
-#define OVERSHOOT_COLD_START_MAX_C              60.0f
-#define OS_DISARM_SOFT_TIMEOUT  (1u << 0)
-#define OS_DISARM_COMMIT        (1u << 1)
+#define OVERSHOOT_SOFT_DISARM_SEC   90.0f
+#define OVERSHOOT_APPLY_DELTA_MAX_C 15.0f   /* trim only in last N °C approach */
+#define OS_DISARM_SOFT_TIMEOUT      (1u << 0)
+#define OS_DISARM_COMMIT            (1u << 1)
 #endif
 
 /*****************************************************************************
  * Lookup tables
  *****************************************************************************/
 
+/*
+ * Driver constraint: use 0 (fully off) or ≥ 5.  Values 1–4 are not functional.
+ * The fixed gate pulse (4 timer steps) overflows the half-cycle boundary for
+ * those values, re-latching the TRIAC and delivering ~25 % unintended power.
+ * Actual power delivery is highly nonlinear — see README for the reference table.
+ */
 /* Temperature delta vs power setpoint breakpoints (LOOKUP mode) */
-static float   deltaBkp[BKP_NUM] = {-10,  0, 0.5,  1,  2,  4,  10,  25,  50,  70};
-static float controlSet[BKP_NUM] = {  0,  0,   1,  1,  1,  2,  15,  30,  60,  80};
+static float   deltaBkp[BKP_NUM] = {-10,   0,  0.5,   1,   2,   4,   10,   25,   50,   70};
+static float controlSet[BKP_NUM] = {  0,   0,    5,   5,   5,   8,   25,   40,   80,  100};
 
 /*
  * Per-second heater power (%) while the pump is on.
@@ -107,7 +116,7 @@ static float controlSet[BKP_NUM] = {  0,  0,   1,  1,  1,  2,  15,  30,  60,  80
  * Phase 4 (~6 s+): puck deteriorates, flow recovers
  */
 static int pumpOnHeatBuff[PUMP_ON_HEAT_BUFF_LEN] = {
-/*  s:  0    1    2    3    4    5    6    7    8    9   10   11   12   13   14   15   16   17   18   19 */
+/*  s:  0    1    2    3     4    5    6    7    8    9   10   11   12   13   14   15   16   17   18   19 */
        100, 100, 100, 100,  80,  80,  40,  40,  30,  30,  30,  40,  40,  40,  40,  60,  60,  60,  60,  60
 };
 
@@ -157,7 +166,9 @@ static uint16_t s_spi_data;
 static float   delta;
 static float   pidOut;
 static int     control;
+#if PWR_TOGGLE_ENABLE
 static int     powerToggle;
+#endif
 static unsigned long long pumpTimer;
 static bool    pump_active;
 static unsigned long long powerOnTimer;
@@ -202,10 +213,9 @@ static void temp_stuck_diag_update(int heating_demand_pct);
 static bool boiler_heater_holdoff(void);
 
 #if OVERSHOOT_DETECT_ENABLE
-static void overshoot_learn_try_arm_cold(const char *site);
+static void overshoot_learn_try_arm_cold(void);
 static void overshoot_peak_detector_update(void);
 static void overshoot_disp_format_str(void);
-static void overshoot_apply_trim_to_control(int *p_control);
 static void overshoot_learn_set_disallowed(uint32_t reason_bits);
 #endif
 
@@ -494,9 +504,9 @@ static void overshoot_learn_set_disallowed(uint32_t reason_bits)
     overshoot_learn_allowed = false;
 }
 
-static void overshoot_learn_try_arm_cold(const char *site)
+static void overshoot_learn_try_arm_cold(void)
 {
-    if (!powerOn || !temp_read_trusted || tempCelsius > OVERSHOOT_COLD_START_MAX_C) {
+    if (!powerOn || !temp_read_trusted) {
         return;
     }
     overshoot_learn_allowed = true;
@@ -506,8 +516,6 @@ static void overshoot_learn_try_arm_cold(const char *site)
     overshoot_excursion_pk = 0.f;
     overshoot_soft_timer_start_us = 0;
     overshoot_detected = false;
-    ESP_LOGI(TAG, "OS arm[%s] OK: cold start @ %.1f°C (trim pre-loaded -%.2f%%)",
-             site, (double)tempCelsius, (double)(overshoot_trim_stored * 100.0f));
 }
 
 static void overshoot_peak_detector_update(void)
@@ -548,7 +556,7 @@ static void overshoot_peak_detector_update(void)
 
     if (tempCelsius <= (float)tempSetpoint) {
         if (overshoot_excursion_latched && overshoot_excursion_pk > 0.01f) {
-            const float peak_c   = overshoot_excursion_pk;
+            const float peak_c   = ceilf(overshoot_excursion_pk);
             const float trim_add = OVERSHOOT_TRIM_FRAC_PER_DEG * peak_c;
             const float trim_prev = overshoot_trim_stored;
             overshoot_trim_stored = fminf(overshoot_trim_stored + trim_add,
@@ -603,18 +611,11 @@ void overshoot_disp_report(void)
     }
 }
 
-static void overshoot_apply_trim_to_control(int *p_control)
-{
-    if ((float)*p_control > (float)OVERSHOOT_TRIM_DEMAND_PCT_THRESHOLD) {
-        float cf = (float)*p_control * (1.f - overshoot_trim_stored);
-        *p_control = (int)(cf + 0.5f);
-    }
-}
 
 /* Public wrappers called from write_cb (rainmaker.c) */
 void control_on_power_on(void)
 {
-    overshoot_learn_try_arm_cold("Power cb");
+    overshoot_learn_try_arm_cold();
 }
 
 void control_on_power_off(void)
@@ -667,22 +668,24 @@ void heatingControl(void)
     if (temp_read_trusted && !pump_active) {
         if (!overshoot_boot_temp_sampled) {
             overshoot_boot_temp_sampled = true;
-            overshoot_learn_try_arm_cold("boot trusted");
+            overshoot_learn_try_arm_cold();
         }
         overshoot_peak_detector_update();
     }
-    int control_after_trim = control_lookup;
-    overshoot_apply_trim_to_control(&control_after_trim);
-    control = control_after_trim;
+    control = (control_lookup > 0 && delta <= OVERSHOOT_APPLY_DELTA_MAX_C)
+              ? (int)((float)control_lookup * (1.f - overshoot_trim_stored) + 0.5f)
+              : control_lookup;
 #else
     control = control_lookup;
 #endif
 
-    /* Dither power within TEMP_PWR_TOGGLE window around setpoint (idle only) */
-    if (!pump_active && (delta > 0) && (delta <= TEMP_PWR_TOGGLE)) {
+#if PWR_TOGGLE_ENABLE
+    /* Dither power within DELTA_PWR_TOGGLE window around setpoint (idle only) */
+    if (!pump_active && (delta > 0) && (delta <= DELTA_PWR_TOGGLE)) {
         powerToggle = (int)((tick % POWER_FACTOR) == 0);
         control = control * powerToggle;
     }
+#endif
 
 #elif (CONTROL_TYPE == PID_LOOKUP)
     pidOut = pidUpdate((float)tempSetpoint, tempCelsius);
@@ -711,6 +714,10 @@ void heatingControl(void)
             }
             control = pumpOnHeatBuff[s];
         }
+    }
+
+    if (control > 0 && control < CONTROL_MIN_NONZERO) {
+        control = CONTROL_MIN_NONZERO;
     }
 
     setPower(ptr_dimmer, control);
@@ -827,7 +834,7 @@ void brewProgram(void)
             brewSignal   = false;
             flushSignal  = false;
 #if OVERSHOOT_DETECT_ENABLE
-            overshoot_learn_try_arm_cold("standby->on");
+            overshoot_learn_try_arm_cold();
 #endif
             ESP_LOGI(TAG, "Switching power ON!");
         }

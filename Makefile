@@ -4,7 +4,7 @@
 #
 
 PROJECT_NAME := espresso
-PROJECT_VER := 2.0.1
+PROJECT_VER := $(shell sed -n '1p' "$(dir $(abspath $(lastword $(MAKEFILE_LIST))))VERSION" | tr -d '\r')
 
 # Add RainMaker components and other common application components
 EXTRA_COMPONENT_DIRS += $(PROJECT_PATH)/../../components $(PROJECT_PATH)/../common

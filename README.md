@@ -6,8 +6,9 @@ This project implements a PID/P controller to effectively control the temperatur
 Another feature implemented is the control of the water pump and pre-infusion settings. Combined, these functionalities allow for
 improved espresso extraction and consistency.
 
-March 2024  
-https://github.com/raffarost/espresso
+**Firmware version** is defined in the repository root file [`VERSION`](VERSION); CMake and the legacy `Makefile` set `PROJECT_VER` from it, and the running image reports it via ESP-IDF (`esp_app_get_description()->version`).
+
+April 2026 — https://github.com/raffarost/espresso
 
 Raffael Rostagno  
 raffael.rostagno@gmail.com
@@ -107,13 +108,47 @@ To calibrate the PID controller, the following symbols can be optimized for each
 
 To calibrate the P controller, the following vectors can be changed:
 
-```
-static float   deltaBkp[BKP_NUM] = {-10,  0, 0.5,  1,  2,  4,  10,  25,  50,  70};
-static float controlSet[BKP_NUM] = {  0,  0,   1,  1,  1,  2,  15,  30,  60,  80};
+```c
+/*    delta °C:  -10   0  0.5   1   2   4   10   25   50   70  */
+static float   deltaBkp[BKP_NUM] = {-10,   0,  0.5,   1,   2,   4,   10,   25,   50,   70};
+static float controlSet[BKP_NUM] = {  0,   0,    5,   5,   5,   8,   15,   30,   80,  100};
 ```
 
-The first vector corresponds to the temperature difference between target and actual reading.
-The second vector is the power factor (0 to 100%) to apply for each (interpolated) delta.
+The first vector is the temperature difference between setpoint and actual reading (°C).
+The second vector is the driver power value (0–100) applied for each (interpolated) delta.
+
+##### TRIAC driver hardware constraint
+
+The dimmer driver uses phase-angle control with a **fixed gate pulse width of 4 timer steps**.
+For driver values 1–4, the gate pulse extends beyond the AC half-cycle boundary, re-latching
+the TRIAC at the start of the next half-cycle and delivering ~25 % average power regardless
+of the intended setting.
+
+**Minimum safe value in `controlSet[]` is 5. Never use values 1–4.**  
+Use 0 (heater fully off) or ≥ 5.
+
+##### Actual power delivery vs. driver value
+
+Phase-angle control is highly nonlinear. The driver value does **not** map linearly to
+delivered power — most of the useful range is concentrated above 20.
+
+| Driver value | Approx. actual power (% of rated) |
+|---|---|
+| 5 | ~0.1 % |
+| 10 | ~0.6 % |
+| 15 | ~2 % |
+| 20 | ~5 % |
+| 25 | ~9 % |
+| 30 | ~15 % |
+| 40 | ~31 % |
+| 50 | ~50 % |
+| 60 | ~69 % |
+| 80 | ~95 % |
+| 99 | ~100 % |
+
+Values below ~15 deliver negligible heat and are only useful in `controlSet[]` as a defined
+floor to avoid the gate-overflow bug (see above).  Practical maintenance and warmup
+calibration should use values in the 15–99 range.
 
 #### Pump heat buffer calibration
 

@@ -1,5 +1,8 @@
 /*
-   Espresso PID/P Controller  v2.0.1
+   Espresso PID/P Controller
+
+   Firmware version comes from the build (PROJECT_VER / esp_app_desc); see
+   the VERSION file at the repository root and README.
 
    This project implements a PID/P controller to effectively control the
    temperature of an Espresso machine boiler for a stable setpoint.
