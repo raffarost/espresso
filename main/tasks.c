@@ -52,8 +52,8 @@ static void task_5000ms(void *arg)
             /* Only report when the device is on to conserve MQTT budget. */
             temp_status_line_report();
             boiler_status_report();
-#if OVERSHOOT_DETECT_ENABLE
-            overshoot_disp_report();
+#if ADAPTIVE_WARMUP_ENABLE
+            dither_disp_report();
 #endif
         }
         xSemaphoreGive(g_state_mutex);

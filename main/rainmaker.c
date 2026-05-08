@@ -97,10 +97,10 @@ static esp_err_t write_cb(const esp_rmaker_device_t *device,
         preInfOffTime = val.val.i;
         ESP_LOGI(TAG, "Pre-Infusion off time: %d s", preInfOffTime);
 
-#if OVERSHOOT_DETECT_ENABLE
-    } else if (strcmp(name, "Reset power trim") == 0) {
+#if ADAPTIVE_WARMUP_ENABLE
+    } else if (strcmp(name, "Reset power factor") == 0) {
         if (val.val.b) {
-            control_reset_overshoot_trim();
+            control_reset_dither();
         }
 #endif
     }
@@ -321,19 +321,18 @@ void rainmaker_init(esp_rmaker_node_t *node)
                                 esp_rmaker_int(1));
     esp_rmaker_device_add_param(espresso_device, p);
 
-#if OVERSHOOT_DETECT_ENABLE
-    /* Warmup power trim display */
-    static char os_disp_str[28];
-    snprintf(os_disp_str, sizeof(os_disp_str), "%.1f%%",
-             (double)(overshoot_trim_stored * 100.0f));
-    overshoot_disp_param = esp_rmaker_param_create("Warmup power trim", NULL,
-                                                   esp_rmaker_str(os_disp_str),
+#if ADAPTIVE_WARMUP_ENABLE
+    /* Approach dither display */
+    static char dith_disp_str[20];
+    snprintf(dith_disp_str, sizeof(dith_disp_str), "%d%%", dither_step_pct());
+    overshoot_disp_param = esp_rmaker_param_create("Power factor (dither)", NULL,
+                                                   esp_rmaker_str(dith_disp_str),
                                                    PROP_FLAG_READ);
     esp_rmaker_param_add_ui_type(overshoot_disp_param, ESP_RMAKER_UI_TEXT);
     esp_rmaker_device_add_param(espresso_device, overshoot_disp_param);
 
-    /* Reset trim trigger */
-    p = esp_rmaker_param_create("Reset power trim", NULL,
+    /* Reset dither trigger */
+    p = esp_rmaker_param_create("Reset power factor", NULL,
                                 esp_rmaker_bool(false),
                                 PROP_FLAG_READ | PROP_FLAG_WRITE);
     esp_rmaker_param_add_ui_type(p, ESP_RMAKER_UI_TRIGGER);

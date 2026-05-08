@@ -3,11 +3,11 @@
 */
 #pragma once
 
-#include "control.h"    /* for OVERSHOOT_DETECT_ENABLE */
+#include "control.h"    /* for ADAPTIVE_WARMUP_ENABLE */
 
 void nvsRead(void);
 void nvsWrite(void);
 
-#if OVERSHOOT_DETECT_ENABLE
-void nvs_persist_overshoot_trim(void);
+#if ADAPTIVE_WARMUP_ENABLE
+void nvs_persist_dither_step(void);
 #endif

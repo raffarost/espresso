@@ -7,7 +7,7 @@
      - Heating element control via lookup / PID (heatingControl)
      - Brew and pre-infusion state machine (brewProgram)
      - Temperature diagnostics and stuck-sensor detection
-     - Overshoot learn / trim (LOOKUP mode only)
+     - Adaptive dither: overshoot and stall detection (LOOKUP mode only)
      - RainMaker status reporting helpers
 */
 
@@ -68,28 +68,33 @@ static const char *TAG = "espresso";
 /* Minimum safe driver value — see controlSet[] comment for the gate-overflow rationale */
 #define CONTROL_MIN_NONZERO     5
 
-/* Power dithering around setpoint (set PWR_TOGGLE_ENABLE to 1 to activate) */
-#define PWR_TOGGLE_ENABLE   1
-#define POWER_50            2    /* 50 % */
-#define POWER_33            3    /* 33 % */
-#define POWER_25            4    /* 25 % */
-#define POWER_FACTOR        POWER_33
-#define DELTA_PWR_TOGGLE    10   /* delta °C window where power is dithered */
+/* Approach window: dithering and stall detection active within this delta */
+#define DELTA_PWR_TOGGLE    10   /* °C below setpoint */
 
 #define POWERON_MIN         (15 * SEC_TO_US(60))    /* standby timeout (15 min) */
 
 /* Status severity priorities */
+#define STATUS_PRI_WARMUP_STALL 10
 #define STATUS_PRI_ZERO         25
 #define STATUS_PRI_UNTRUSTED    50
 #define STATUS_PRI_TOO_HIGH     75
 #define STATUS_PRI_STUCK        100
 #define STATUS_WORST_CLEAR_OK_REPORTS   12  /* Task5000ms ticks (~60 s) */
 
-#if OVERSHOOT_DETECT_ENABLE
-#define OVERSHOOT_SOFT_DISARM_SEC   90.0f
-#define OVERSHOOT_APPLY_DELTA_MAX_C 15.0f   /* trim only in last N °C approach */
-#define OS_DISARM_SOFT_TIMEOUT      (1u << 0)
-#define OS_DISARM_COMMIT            (1u << 1)
+#if ADAPTIVE_WARMUP_ENABLE
+#define DITHER_STALL_SEC        30.0f   /* no delta progress → stall */
+#define DITHER_SOFT_SETTLE_SEC  60.0f   /* wait at setpoint before clean commit */
+#define OVERSHOOT_SEVERE_PEAK_C  5.0f   /* peak ≥ this → step+2, else step+1 */
+
+/* Named aliases for dither_steps[] indices */
+#define POWER_100   0
+#define POWER_75    1
+#define POWER_50    2
+#define POWER_25    3
+
+/* Power factor applied within TEMP_DELTA of setpoint for accurate
+ * temperature maintenance — lower than the adaptive approach step. */
+#define POWER_NEAR_SETPOINT  POWER_50
 #endif
 
 /*****************************************************************************
@@ -104,7 +109,7 @@ static const char *TAG = "espresso";
  */
 /* Temperature delta vs power setpoint breakpoints (LOOKUP mode) */
 static float   deltaBkp[BKP_NUM] = {-10,   0,  0.5,   1,   2,   4,   10,   25,   50,   70};
-static float controlSet[BKP_NUM] = {  0,   0,    5,   5,   5,   8,   25,   40,   80,  100};
+static float controlSet[BKP_NUM] = {  0,   0,   10,  10,  20,  30,   40,   50,   80,  100};
 
 /*
  * Per-second heater power (%) while the pump is on.
@@ -117,7 +122,7 @@ static float controlSet[BKP_NUM] = {  0,   0,    5,   5,   5,   8,   25,   40,  
  */
 static int pumpOnHeatBuff[PUMP_ON_HEAT_BUFF_LEN] = {
 /*  s:  0    1    2    3     4    5    6    7    8    9   10   11   12   13   14   15   16   17   18   19 */
-       100, 100, 100, 100,  80,  80,  40,  40,  30,  30,  30,  40,  40,  40,  40,  60,  60,  60,  60,  60
+       100, 100, 100, 100,  80,  80,  50,  50,  40,  40,  40,  50,  50,  50,  50,  70,  70,  70,  70,  70
 };
 
 /*****************************************************************************
@@ -139,15 +144,15 @@ bool    tempLock    = true;
 bool    preInfusion = true;
 float   tempCelsius;
 
-#if OVERSHOOT_DETECT_ENABLE
-float overshoot_trim_stored;
+#if ADAPTIVE_WARMUP_ENABLE
+int dither_step = DITHER_STEP_DEFAULT;
 #endif
 
 /* RainMaker param handles — defined here, created by rainmaker_init() */
 esp_rmaker_param_t *primary;
 esp_rmaker_param_t *status_param;
 esp_rmaker_param_t *poweron_param;
-#if OVERSHOOT_DETECT_ENABLE
+#if ADAPTIVE_WARMUP_ENABLE
 esp_rmaker_param_t *overshoot_disp_param;
 #endif
 
@@ -166,9 +171,6 @@ static uint16_t s_spi_data;
 static float   delta;
 static float   pidOut;
 static int     control;
-#if PWR_TOGGLE_ENABLE
-static int     powerToggle;
-#endif
 static unsigned long long pumpTimer;
 static bool    pump_active;
 static unsigned long long powerOnTimer;
@@ -191,16 +193,22 @@ static int      s_status_worst_pri;
 static char     s_status_worst_str[48];
 static uint16_t s_status_ok_clean_reports;
 
-#if OVERSHOOT_DETECT_ENABLE
-static char              s_overshoot_disp_str[28];
-static float             overshoot_excursion_pk;
-static bool              overshoot_excursion_latched;
-static bool              overshoot_detected;
-static bool              overshoot_learn_allowed;
-static bool              overshoot_learn_ever_armed;
-static uint32_t          overshoot_learn_disarm_mask;
-static bool              overshoot_boot_temp_sampled;
-static unsigned long long overshoot_soft_timer_start_us;
+#if ADAPTIVE_WARMUP_ENABLE
+static char               s_dither_disp_str[20];
+static float              overshoot_excursion_pk;
+static bool               overshoot_excursion_latched;
+static bool               overshoot_detected;
+static bool               learn_armed;
+static bool               learn_ever_armed;
+static bool               boot_temp_sampled;
+static unsigned long long soft_timer_us;
+static bool               stall_active;
+static float              stall_delta_min;
+static unsigned long long stall_timer_us;
+static bool               stall_armed;
+static bool               stall_nvs_pending;
+static bool               warmup_nv_committed; /* true after first NVS write; maintenance mode */
+static int                dither_step_nv;      /* shadow of the last NVS-persisted step */
 #endif
 
 /*****************************************************************************
@@ -212,11 +220,10 @@ static void temp_read_note_good(float celsius);
 static void temp_stuck_diag_update(int heating_demand_pct);
 static bool boiler_heater_holdoff(void);
 
-#if OVERSHOOT_DETECT_ENABLE
-static void overshoot_learn_try_arm_cold(void);
+#if ADAPTIVE_WARMUP_ENABLE
+static void adaptive_try_arm_cold(void);
+static void stall_detector_update(void);
 static void overshoot_peak_detector_update(void);
-static void overshoot_disp_format_str(void);
-static void overshoot_learn_set_disallowed(uint32_t reason_bits);
 #endif
 
 /*****************************************************************************
@@ -450,6 +457,11 @@ void boiler_status_report(void)
     } else if (tempCelsius > (float)MAX_TEMP_THR) {
         cur_pri = STATUS_PRI_TOO_HIGH;
         cur_msg = "Temp too high";
+#if ADAPTIVE_WARMUP_ENABLE
+    } else if (stall_active) {
+        cur_pri = STATUS_PRI_WARMUP_STALL;
+        cur_msg = "Warmup stall";
+#endif
     }
 
     if (cur_pri > s_status_worst_pri) {
@@ -493,157 +505,251 @@ void boiler_status_report(void)
 }
 
 /*****************************************************************************
- * Overshoot learn / trim (LOOKUP mode only)
+ * Adaptive dither — overshoot and stall detection (LOOKUP mode only)
  *****************************************************************************/
 
-#if OVERSHOOT_DETECT_ENABLE
+#if ADAPTIVE_WARMUP_ENABLE
 
-static void overshoot_learn_set_disallowed(uint32_t reason_bits)
-{
-    overshoot_learn_disarm_mask |= reason_bits;
-    overshoot_learn_allowed = false;
-}
+/* Duty step table: (period, on_count) → duty = on_count / period */
+typedef struct { uint8_t period; uint8_t on_count; } dither_step_t;
+static const dither_step_t dither_steps[DITHER_STEP_COUNT] = {
+    {1, 1},  /* step 0: 100 % */
+    {4, 3},  /* step 1:  75 % */
+    {2, 1},  /* step 2:  50 % — default */
+    {4, 1},  /* step 3:  25 % */
+};
+_Static_assert(sizeof(dither_steps) / sizeof(dither_steps[0]) == DITHER_STEP_COUNT,
+               "dither_steps[] size mismatch with DITHER_STEP_COUNT");
 
-static void overshoot_learn_try_arm_cold(void)
+/* ---- arm / disarm ---------------------------------------------------- */
+
+static void adaptive_try_arm_cold(void)
 {
     if (!powerOn || !temp_read_trusted) {
         return;
     }
-    overshoot_learn_allowed = true;
-    overshoot_learn_ever_armed = true;
-    overshoot_learn_disarm_mask = 0u;
+    if (!learn_ever_armed) {
+        dither_step_nv = dither_step; /* capture the NVS value loaded at boot */
+    }
+    learn_armed             = true;
+    learn_ever_armed        = true;
     overshoot_excursion_latched = false;
-    overshoot_excursion_pk = 0.f;
-    overshoot_soft_timer_start_us = 0;
-    overshoot_detected = false;
+    overshoot_excursion_pk  = 0.f;
+    soft_timer_us           = 0;
+    overshoot_detected      = false;
+    stall_armed             = false;
+    stall_active            = false;
+    stall_nvs_pending       = false;
+    warmup_nv_committed     = false;
 }
 
-static void overshoot_peak_detector_update(void)
+/* ---- stall detector -------------------------------------------------- */
+
+static void stall_detector_update(void)
 {
-    if (!overshoot_learn_allowed || temp_stuck_diag) {
+    if (!learn_armed || temp_stuck_diag) {
+        stall_armed = false;
         return;
     }
 
-    const float temp_ok_max = (float)tempSetpoint + (float)TEMP_DELTA;
+    const bool in_approach = (delta > 0.f && delta <= (float)DELTA_PWR_TOGGLE);
 
-    if (tempCelsius > temp_ok_max) {
-        overshoot_detected = true;
+    if (!in_approach) {
+        stall_armed  = false;
+        stall_active = false; /* left approach zone — clear status */
+        return;
+    }
+
+    if (!stall_armed) {
+        /* Entering approach window: snapshot best delta and start timer */
+        stall_delta_min = delta;
+        stall_timer_us  = getAbsTime1us();
+        stall_armed     = true;
+        return;
+    }
+
+    if (delta < stall_delta_min) {
+        /* Progress: reset timer */
+        stall_delta_min = delta;
+        stall_timer_us  = getAbsTime1us();
+        return;
+    }
+
+    if ((getAbsTime1us() - stall_timer_us) >=
+            (unsigned long long)SEC_TO_US(DITHER_STALL_SEC)) {
+        stall_armed = false; /* one fire per approach entry */
+        if (dither_step > 0) {
+            dither_step--;
+            if (!warmup_nv_committed) {
+                stall_nvs_pending = true; /* deferred NVS write for cold warmup only */
+            }
+        }
+        stall_active = true;
+        ESP_LOGI(TAG, "Warmup stall: step -> %d (%d%% duty)%s",
+                 dither_step,
+                 dither_steps[dither_step].on_count * 100 / dither_steps[dither_step].period,
+                 warmup_nv_committed ? " [maintenance]" : "");
+        dither_disp_report();
+    }
+}
+
+/* ---- overshoot peak detector ----------------------------------------- */
+
+static void overshoot_peak_detector_update(void)
+{
+    if (!learn_armed || temp_stuck_diag) {
+        return;
+    }
+
+    /* Discard excursion state on setpoint change — prevents false latch
+     * when setpoint is moved down below the current temperature. */
+    static int32_t last_sp = 0;
+    if (tempSetpoint != last_sp) {
+        last_sp                     = tempSetpoint;
+        overshoot_excursion_latched = false;
+        overshoot_excursion_pk      = 0.f;
+        overshoot_detected          = false;
+        soft_timer_us               = 0;
+    }
+
+    const float sp = (float)tempSetpoint;
+
+    if (tempCelsius > sp + (float)TEMP_DELTA) {
+        overshoot_detected      = true;
         overshoot_excursion_latched = true;
+        soft_timer_us           = 0; /* cancel soft timer */
     }
 
-    if (!overshoot_detected) {
-        if (overshoot_soft_timer_start_us == 0ULL && tempCelsius >= (float)tempSetpoint) {
-            overshoot_soft_timer_start_us = getAbsTime1us();
-        } else if (overshoot_soft_timer_start_us != 0ULL &&
-                   (getAbsTime1us() - overshoot_soft_timer_start_us) >=
-                       (unsigned long long)SEC_TO_US(OVERSHOOT_SOFT_DISARM_SEC)) {
-            overshoot_learn_set_disallowed(OS_DISARM_SOFT_TIMEOUT);
-            overshoot_soft_timer_start_us = 0;
-            overshoot_detected = false;
-            overshoot_excursion_latched = false;
-            overshoot_excursion_pk = 0.f;
-            ESP_LOGI(TAG, "OS learn disarmed (soft): no excursion above setpoint+%d°C "
-                     "within %.0f s", TEMP_DELTA, (double)OVERSHOOT_SOFT_DISARM_SEC);
-            overshoot_disp_report();
-            return;
+    /* Soft timer: cold warmup only — started on first clean reach of setpoint.
+     * If no overshoot fires within DITHER_SOFT_SETTLE_SEC, commit any pending
+     * stall step and disarm. Skipped in maintenance (warmup_nv_committed). */
+    if (!overshoot_detected && !warmup_nv_committed) {
+        if (soft_timer_us == 0ULL && tempCelsius >= sp) {
+            soft_timer_us = getAbsTime1us();
+        } else if (soft_timer_us != 0ULL &&
+                   (getAbsTime1us() - soft_timer_us) >=
+                       (unsigned long long)SEC_TO_US(DITHER_SOFT_SETTLE_SEC)) {
+            if (stall_nvs_pending) {
+                stall_nvs_pending = false;
+                nvs_persist_dither_step();
+                dither_step_nv = dither_step;
+                ESP_LOGI(TAG, "Stall step committed: step %d (%d%%)",
+                         dither_step,
+                         dither_steps[dither_step].on_count * 100 /
+                             dither_steps[dither_step].period);
+            }
+            warmup_nv_committed = true;
+            soft_timer_us       = 0;
+            dither_disp_report(); /* learn_armed stays true — maintenance begins */
         }
     }
 
-    if (overshoot_excursion_latched && tempCelsius > (float)tempSetpoint) {
-        const float above = tempCelsius - (float)tempSetpoint;
-        overshoot_excursion_pk = fmaxf(overshoot_excursion_pk, above);
+    /* Track peak excursion above setpoint */
+    if (overshoot_excursion_latched && tempCelsius > sp) {
+        overshoot_excursion_pk = fmaxf(overshoot_excursion_pk, tempCelsius - sp);
     }
 
-    if (tempCelsius <= (float)tempSetpoint) {
-        if (overshoot_excursion_latched && overshoot_excursion_pk > 0.01f) {
-            const float peak_c   = ceilf(overshoot_excursion_pk);
-            const float trim_add = OVERSHOOT_TRIM_FRAC_PER_DEG * peak_c;
-            const float trim_prev = overshoot_trim_stored;
-            overshoot_trim_stored = fminf(overshoot_trim_stored + trim_add,
-                                          OVERSHOOT_TRIM_FRAC_MAX);
-            ESP_LOGI(TAG,
-                     "OS commit: peak +%.2f°C -> cut +%.2f%% (-%.2f%% -> -%.2f%%%s)",
-                     (double)peak_c,
-                     (double)(trim_add * 100.0f),
-                     (double)(trim_prev * 100.0f),
-                     (double)(overshoot_trim_stored * 100.0f),
-                     (overshoot_trim_stored >= OVERSHOOT_TRIM_FRAC_MAX - 1e-6f)
-                         ? ", CAPPED" : "");
-            nvs_persist_overshoot_trim();
-            overshoot_learn_set_disallowed(OS_DISARM_COMMIT);
-            overshoot_soft_timer_start_us = 0;
-            overshoot_detected = false;
-            overshoot_excursion_pk = 0.f;
+    /* Commit when temp drops back to setpoint after an overshoot */
+    if (tempCelsius <= sp && overshoot_excursion_latched &&
+            overshoot_excursion_pk > 0.01f) {
+        const float peak   = overshoot_excursion_pk;
+        const int step_inc = (peak >= OVERSHOOT_SEVERE_PEAK_C) ? 2 : 1;
+        const int new_step = dither_step + step_inc;
+        dither_step         = (new_step < DITHER_STEP_COUNT) ? new_step
+                                                              : DITHER_STEP_COUNT - 1;
+        stall_nvs_pending   = false;
+        soft_timer_us       = 0;
+        overshoot_detected  = false;
+        overshoot_excursion_pk      = 0.f;
+        overshoot_excursion_latched = false;
+        if (!warmup_nv_committed) {
+            nvs_persist_dither_step();
+            dither_step_nv      = dither_step;
+            warmup_nv_committed = true; /* learn_armed stays true — maintenance begins */
         }
+        /* maintenance: learn_armed stays true, step change is RAM-only */
+        ESP_LOGI(TAG, "Overshoot: peak +%.2f°C -> step+%d -> step %d (%d%%)%s",
+                 (double)peak, step_inc, dither_step,
+                 dither_steps[dither_step].on_count * 100 /
+                     dither_steps[dither_step].period,
+                 warmup_nv_committed ? " [maintenance]" : "");
+        dither_disp_report();
+        return;
+    }
+
+    if (tempCelsius <= sp) {
         overshoot_excursion_latched = false;
     }
 }
 
-static void overshoot_disp_format_str(void)
-{
-    const float cut_pct = overshoot_trim_stored * 100.0f;
+/* ---- display --------------------------------------------------------- */
 
-    if (overshoot_learn_allowed && overshoot_excursion_latched &&
-        overshoot_excursion_pk > 0.01f) {
-        snprintf(s_overshoot_disp_str, sizeof(s_overshoot_disp_str),
-                 "%s%.1f%% +%.1f°C",
-                 cut_pct > 0.05f ? "-" : "",
-                 (double)cut_pct, (double)overshoot_excursion_pk);
-    } else {
-        snprintf(s_overshoot_disp_str, sizeof(s_overshoot_disp_str),
-                 "%s%.1f%%",
-                 cut_pct > 0.05f ? "-" : "", (double)cut_pct);
-    }
-}
-
-void overshoot_disp_report(void)
+void dither_disp_report(void)
 {
     if (!powerOn) {
         return;
     }
-    overshoot_disp_format_str();
+    snprintf(s_dither_disp_str, sizeof(s_dither_disp_str), "%d%%",
+             dither_steps[dither_step].on_count * 100 /
+                 dither_steps[dither_step].period);
     if (overshoot_disp_param) {
         esp_err_t e = esp_rmaker_param_update_and_report(overshoot_disp_param,
-                                                          esp_rmaker_str(s_overshoot_disp_str));
+                                                          esp_rmaker_str(s_dither_disp_str));
         if (e != ESP_OK) {
-            ESP_LOGW(TAG, "Overshoot display report: %s", esp_err_to_name(e));
+            ESP_LOGW(TAG, "Dither display report: %s", esp_err_to_name(e));
         }
     }
 }
 
+int dither_step_pct(void)
+{
+    return dither_steps[dither_step].on_count * 100 / dither_steps[dither_step].period;
+}
 
-/* Public wrappers called from write_cb (rainmaker.c) */
+/* ---- public API ------------------------------------------------------ */
+
 void control_on_power_on(void)
 {
-    overshoot_learn_try_arm_cold();
+    adaptive_try_arm_cold();
 }
 
 void control_on_power_off(void)
 {
-    overshoot_learn_ever_armed = false;
+    dither_step         = dither_step_nv; /* discard maintenance-only RAM adjustments */
+    learn_armed         = false;
+    learn_ever_armed    = false;
+    stall_armed         = false;
+    stall_active        = false;
+    stall_nvs_pending   = false;
+    warmup_nv_committed = false;
 }
 
-void control_reset_overshoot_trim(void)
+void control_reset_dither(void)
 {
-    overshoot_trim_stored = 0.f;
-    overshoot_learn_allowed = true;
-    overshoot_learn_ever_armed = false;
-    overshoot_learn_disarm_mask = 0u;
-    overshoot_soft_timer_start_us = 0;
-    overshoot_detected = false;
+    dither_step             = DITHER_STEP_DEFAULT;
+    learn_armed             = false;
+    learn_ever_armed        = false;
+    soft_timer_us           = 0;
+    overshoot_detected      = false;
     overshoot_excursion_latched = false;
-    overshoot_excursion_pk = 0.f;
-    nvs_persist_overshoot_trim();
-    ESP_LOGI(TAG, "Warmup trim reset (NVS cleared, learn re-armed if cold)");
-    overshoot_disp_report();
+    overshoot_excursion_pk  = 0.f;
+    stall_armed             = false;
+    stall_active            = false;
+    stall_nvs_pending       = false;
+    nvs_persist_dither_step();
+    dither_step_nv          = dither_step;
+    ESP_LOGI(TAG, "Dither reset: step %d (%d%%)", DITHER_STEP_DEFAULT,
+             dither_steps[DITHER_STEP_DEFAULT].on_count * 100 /
+                 dither_steps[DITHER_STEP_DEFAULT].period);
+    dither_disp_report();
 }
 
-#else /* !OVERSHOOT_DETECT_ENABLE */
+#else /* !ADAPTIVE_WARMUP_ENABLE */
 
 void control_on_power_on(void) {}
 void control_on_power_off(void) {}
 
-#endif /* OVERSHOOT_DETECT_ENABLE */
+#endif /* ADAPTIVE_WARMUP_ENABLE */
 
 /*****************************************************************************
  * Heating element control
@@ -664,27 +770,30 @@ void heatingControl(void)
     float ir = indexRatio(deltaBkp, BKP_NUM, delta);
     const int control_lookup = (int)interp1D(controlSet, BKP_NUM, ir);
 
-#if OVERSHOOT_DETECT_ENABLE
+#if ADAPTIVE_WARMUP_ENABLE
     if (temp_read_trusted && !pump_active) {
-        if (!overshoot_boot_temp_sampled) {
-            overshoot_boot_temp_sampled = true;
-            overshoot_learn_try_arm_cold();
+        if (!boot_temp_sampled) {
+            boot_temp_sampled = true;
+            adaptive_try_arm_cold();
         }
-        overshoot_peak_detector_update();
+        if (learn_ever_armed) {
+            stall_detector_update();
+            overshoot_peak_detector_update();
+        }
     }
-    control = (control_lookup > 0 && delta <= OVERSHOOT_APPLY_DELTA_MAX_C)
-              ? (int)((float)control_lookup * (1.f - overshoot_trim_stored) + 0.5f)
-              : control_lookup;
+    /* Adaptive dithering — always active in the approach window.
+     * Within TEMP_DELTA of setpoint, lock to step 3 (33 %) to cap power
+     * and prevent stall/overshoot from fighting each other near target. */
+    if (!pump_active && delta > 0.f && delta <= (float)DELTA_PWR_TOGGLE) {
+        const dither_step_t *s = (delta <= (float)TEMP_DELTA)
+                                 ? &dither_steps[POWER_NEAR_SETPOINT]
+                                 : &dither_steps[dither_step];
+        control = ((tick % (int)s->period) < (int)s->on_count) ? control_lookup : 0;
+    } else {
+        control = control_lookup;
+    }
 #else
     control = control_lookup;
-#endif
-
-#if PWR_TOGGLE_ENABLE
-    /* Dither power within DELTA_PWR_TOGGLE window around setpoint (idle only) */
-    if (!pump_active && (delta > 0) && (delta <= DELTA_PWR_TOGGLE)) {
-        powerToggle = (int)((tick % POWER_FACTOR) == 0);
-        control = control * powerToggle;
-    }
 #endif
 
 #elif (CONTROL_TYPE == PID_LOOKUP)
@@ -783,8 +892,8 @@ void brewProgram(void)
             if (!powerOn || (getAbsTime1us() - powerOnTimer) > POWERON_MIN) {
                 brewState = BREW_POWER_OFF;
                 powerOn   = false;
-#if OVERSHOOT_DETECT_ENABLE
-                overshoot_learn_ever_armed = false;
+#if ADAPTIVE_WARMUP_ENABLE
+                learn_ever_armed = false;
 #endif
                 esp_rmaker_param_update_and_report(poweron_param,
                                                    esp_rmaker_bool(powerOn));
@@ -833,8 +942,8 @@ void brewProgram(void)
             brewState    = BREW_OFF;
             brewSignal   = false;
             flushSignal  = false;
-#if OVERSHOOT_DETECT_ENABLE
-            overshoot_learn_try_arm_cold();
+#if ADAPTIVE_WARMUP_ENABLE
+            adaptive_try_arm_cold();
 #endif
             ESP_LOGI(TAG, "Switching power ON!");
         }

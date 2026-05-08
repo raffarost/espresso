@@ -2,8 +2,14 @@
    Espresso — shared state, configuration, and control API
 
    This header is included by all modules that share control state or call
-   control functions. It owns the CONTROL_TYPE / OVERSHOOT_DETECT_ENABLE
+   control functions. It owns the CONTROL_TYPE / ADAPTIVE_WARMUP_ENABLE
    compile-time knobs so every translation unit sees the same setting.
+
+   Adaptive dither (ADAPTIVE_WARMUP_ENABLE):
+     Replaces the old fixed-duty toggle and overshoot trim fraction with a
+     5-step duty table (75 → 25 %).  Stall detection and overshoot peak
+     detection adjust the step index each warmup cycle; the result is
+     persisted to NVS so the machine adapts across seasons.
 */
 #pragma once
 
@@ -26,9 +32,9 @@
 
 #define CONTROL_TYPE    LOOKUP
 
-/* Overshoot learn/trim for LOOKUP only; on by default. */
-#if (CONTROL_TYPE == LOOKUP) && !defined(OVERSHOOT_DETECT_ENABLE)
-#define OVERSHOOT_DETECT_ENABLE  1
+/* Adaptive warmup strategy for LOOKUP only; on by default. */
+#if (CONTROL_TYPE == LOOKUP) && !defined(ADAPTIVE_WARMUP_ENABLE)
+#define ADAPTIVE_WARMUP_ENABLE  1
 #endif
 
 /*****************************************************************************
@@ -47,13 +53,11 @@
 #define TEMP_SETPOINT_MAX   96
 
 /*****************************************************************************
- * Overshoot NVS encoding helpers (also used by nvs.c)
+ * Adaptive dither — shared constants (used by control.c and nvs.c)
  *****************************************************************************/
-#if OVERSHOOT_DETECT_ENABLE
-#define OVERSHOOT_TRIM_FRAC_MAX             0.50f
-#define OVERSHOOT_TRIM_FRAC_PER_DEG         0.10f
-#define OVERSHOOT_TRIM_FRAC_TO_MPCT(f)      ((int32_t)lroundf((f) * 100000.0f))
-#define OVERSHOOT_TRIM_MPCT_TO_FRAC(i)      ((float)(i) * 0.00001f)
+#if ADAPTIVE_WARMUP_ENABLE
+#define DITHER_STEP_DEFAULT     2   /* index into step table → 50 % duty */
+#define DITHER_STEP_COUNT       4   /* steps 0–3: 100 / 75 / 50 / 25 % */
 #endif
 
 /*****************************************************************************
@@ -84,8 +88,8 @@ extern bool    tempLock;
 extern bool    preInfusion;
 extern float   tempCelsius;
 
-#if OVERSHOOT_DETECT_ENABLE
-extern float overshoot_trim_stored;
+#if ADAPTIVE_WARMUP_ENABLE
+extern int dither_step;             /* current step index, 0 = most power */
 #endif
 
 /*****************************************************************************
@@ -95,7 +99,7 @@ extern float overshoot_trim_stored;
 extern esp_rmaker_param_t *primary;
 extern esp_rmaker_param_t *status_param;
 extern esp_rmaker_param_t *poweron_param;
-#if OVERSHOOT_DETECT_ENABLE
+#if ADAPTIVE_WARMUP_ENABLE
 extern esp_rmaker_param_t *overshoot_disp_param;
 #endif
 
@@ -113,7 +117,8 @@ void boiler_status_report(void);
 void control_on_power_on(void);
 void control_on_power_off(void);
 
-#if OVERSHOOT_DETECT_ENABLE
-void overshoot_disp_report(void);
-void control_reset_overshoot_trim(void);
+#if ADAPTIVE_WARMUP_ENABLE
+void dither_disp_report(void);
+void control_reset_dither(void);
+int  dither_step_pct(void);         /* current duty in % (75 / 66 / 50 / 33 / 25) */
 #endif

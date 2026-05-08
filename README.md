@@ -111,7 +111,7 @@ To calibrate the P controller, the following vectors can be changed:
 ```c
 /*    delta °C:  -10   0  0.5   1   2   4   10   25   50   70  */
 static float   deltaBkp[BKP_NUM] = {-10,   0,  0.5,   1,   2,   4,   10,   25,   50,   70};
-static float controlSet[BKP_NUM] = {  0,   0,    5,   5,   5,   8,   15,   30,   80,  100};
+static float controlSet[BKP_NUM] = {  0,   0,    5,   5,   8,  20,   30,   50,   80,  100};
 ```
 
 The first vector is the temperature difference between setpoint and actual reading (°C).
@@ -150,6 +150,53 @@ Values below ~15 deliver negligible heat and are only useful in `controlSet[]` a
 floor to avoid the gate-overflow bug (see above).  Practical maintenance and warmup
 calibration should use values in the 15–99 range.
 
+#### Adaptive warmup (`ADAPTIVE_WARMUP_ENABLE`)
+
+When `CONTROL_TYPE == LOOKUP`, the adaptive warmup strategy is enabled automatically. It replaces the old fixed-duty power toggle with a self-tuning mechanism that adjusts heater duty during the final approach to setpoint.
+
+##### Dither step table
+
+Within `DELTA_PWR_TOGGLE` (10 °C below setpoint), the heater is pulsed at a duty cycle determined by the current *step index* (0–4):
+
+| Step | Duty  | Period / on-count |
+|------|-------|-------------------|
+| 0    | 100 % | 1 / 1             |
+| 1    |  75 % | 4 / 3             |
+| 2    |  50 % | 2 / 1 — **default** |
+| 3    |  25 % | 4 / 1             |
+
+Within `TEMP_DELTA` (2 °C) of setpoint, the step is overridden to `POWER_NEAR_SETPOINT` (default: step 3, 33 %) regardless of the learned index, to prevent overshoot and overly aggressive fighting between the stall and overshoot detectors near the target.
+
+The current duty is reported in the RainMaker UI as **Power factor (dither)**. The step index is persisted to NVS (`dithStep`) and restored on each reboot, so the machine retains its seasonal calibration across power cycles.
+
+##### Overshoot detection
+
+After the approach phase, if the temperature exceeds `tempSetpoint + TEMP_DELTA`, an overshoot is latched. The peak excursion above setpoint is tracked until the temperature drops back to setpoint, then the step is incremented (less power next warmup):
+
+- Peak < 5 °C → `step + 1`
+- Peak ≥ 5 °C (`OVERSHOOT_SEVERE_PEAK_C`) → `step + 2`
+
+The step is clamped at 4 (25 %). The NVS value is written after the commit.
+
+##### Warmup stall detection
+
+During the approach window, the detector tracks the best (smallest) delta seen since entering the window. A 30-second timer (`DITHER_STALL_SEC`) is reset every time a new delta minimum is recorded. If the timer expires — meaning temperature has not improved in 30 s — a **warmup stall** is declared:
+
+- `step - 1` (more heater power) is applied immediately in RAM.
+- The NVS write is deferred until the end of the warmup cycle (overshoot settle or soft-settle).
+- The **Status** diagnostic field shows `"Warmup stall"` while the stall is active, clearing automatically once the setpoint is reached.
+
+The stall detector is inhibited while `temp_stuck_diag` is active (frozen sensor) to avoid false step adjustments based on stale readings.
+
+##### Self-correcting behaviour
+
+The two detectors naturally balance each other:
+
+- Stall fires → `step - 1` → more power → may cause overshoot → `step + 1` → net 0 (learning discarded)
+- Stall fires → `step - 1` → severe overshoot → `step + 2` → net +1 (learned: needs less power overall)
+
+The step is reset to `DITHER_STEP_DEFAULT` (50 %) via the **Reset power factor** button in the RainMaker UI.
+
 #### Pump heat buffer calibration
 
 When the pump is active (pre-infusion, brew, or flush), cold water entering the boiler causes a
@@ -158,7 +205,7 @@ temperature controller:
 
 ```
 static int pumpOnHeatBuff[PUMP_ON_HEAT_BUFF_LEN] = {
-    100, 100, 100, 100,  80,  80,  40,  40,  30,  30,  30,  40,  40,  40,  40,  60,  60,  60,  60,  60
+    100, 100, 100, 100,  80,  80,  50,  50,  40,  40,  40,  50,  50,  50,  50,  70,  70,  70,  70,  70
 };
 ```
 
