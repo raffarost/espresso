@@ -1,81 +1,261 @@
 dependencies:
+  espressif/button:
+    component_hash: d0afa32f0e50d60bc0c6fc23f7eea98adc6b02cfe70b590bc52c23c506745287
+    dependencies:
+    - name: espressif/cmake_utilities
+      registry_url: https://components.espressif.com
+      require: private
+      version: '*'
+    - name: idf
+      require: private
+      version: '>=4.0'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 4.1.6
   espressif/cbor:
-    component_hash: 440f4ee4504841cc9b4f3a8ef755776a612ac9dace355514c68b999868f990ff
+    component_hash: dad9ca860963e930366510a10b422b3125a4fb27b979712ed65efcbcd742de50
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=5.0'
     source:
-      service_url: https://api.components.espressif.com/
+      registry_url: https://components.espressif.com/
       type: service
-    version: 0.6.0~1
-  espressif/esp_diag_data_store:
-    component_hash: null
+    version: 0.6.1~4
+  espressif/cmake_utilities:
+    component_hash: 05165f30922b422b4b90c08845e6d449329b97370fbd06309803d8cb539d79e3
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=4.1'
     source:
-      path: /home/ralph/.espressif/esp-rainmaker/components/esp-insights/components/esp_diag_data_store
-      type: local
-    version: 1.0.1
-  espressif/esp_diagnostics:
-    component_hash: null
-    source:
-      path: /home/ralph/.espressif/esp-rainmaker/components/esp-insights/components/esp_diagnostics
-      type: local
-    version: 1.0.1
-  espressif/esp_insights:
-    component_hash: null
-    source:
-      path: /home/ralph/.espressif/esp-rainmaker/components/esp-insights/components/esp_insights
-      type: local
-    version: 1.0.1
-  espressif/esp_rainmaker:
-    component_hash: null
-    source:
-      path: /home/ralph/.espressif/esp-rainmaker/components/esp_rainmaker
-      type: local
-    version: 1.1.0
-  espressif/esp_schedule:
-    component_hash: null
-    source:
-      path: /home/ralph/.espressif/esp-rainmaker/components/esp_schedule
-      type: local
-    version: 1.1.0
-  espressif/esp_secure_cert_mgr:
-    component_hash: a20007d67e65a000670ab77e45d7554c943eb8dcb0abeada0a57dd9adac3a703
-    source:
-      service_url: https://api.components.espressif.com/
+      registry_url: https://components.espressif.com
       type: service
-    version: 2.4.1
-  espressif/json_generator:
-    component_hash: null
-    source:
-      path: /home/ralph/.espressif/esp-rainmaker/components/json_generator
-      type: local
     version: 1.1.1
-  espressif/json_parser:
-    component_hash: null
+  espressif/esp_daylight:
+    component_hash: e27629eb7e12da9e6d01c646e0e4ce6358b977b6f89d4f291a4cc1aea755af94
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=5.1'
     source:
-      path: /home/ralph/.espressif/esp-rainmaker/components/json_parser
-      type: local
+      registry_url: https://components.espressif.com
+      type: service
+    version: 1.0.1
+  espressif/esp_diag_data_store:
+    component_hash: 93f20de81abb791b4482f1bc99afdc24b25c3ee42aacceeb636e9943e677b1c5
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=5.1'
+    source:
+      registry_url: https://components.espressif.com
+      type: service
+    version: 1.1.0
+  espressif/esp_diagnostics:
+    component_hash: 32f2e8b9fea1e055a8460fb8afdc96360c40dd461128ee13ceed44296c068e90
+    dependencies:
+    - name: espressif/rmaker_common
+      registry_url: https://components.espressif.com
+      require: private
+      version: ^1.5
+    - name: idf
+      require: private
+      version: '>=5.1'
+    source:
+      registry_url: https://components.espressif.com
+      type: service
+    version: 1.3.3
+  espressif/esp_insights:
+    component_hash: ed93cb82d424d9c651d656ef19b6de5b78bb356fefaa5b4003c136ef188846e3
+    dependencies:
+    - name: espressif/cbor
+      registry_url: https://components.espressif.com
+      require: private
+      version: ~0.6
+    - name: espressif/esp_diag_data_store
+      registry_url: https://components.espressif.com
+      require: private
+      version: 1.1.0
+    - name: espressif/esp_diagnostics
+      registry_url: https://components.espressif.com
+      require: private
+      version: '>=1.3.0'
+    - name: espressif/rmaker_common
+      registry_url: https://components.espressif.com
+      require: private
+      version: ^1.5
+    - name: idf
+      require: private
+      version: '>=5.1'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 1.3.3
+  espressif/esp_rainmaker:
+    component_hash: 006d95ee136e9b912484c1b942d620e0f33399af153ab684c39478ebb1c16bbb
+    dependencies:
+    - name: espressif/cbor
+      registry_url: https://components.espressif.com
+      require: private
+      version: ~0.6
+    - name: espressif/esp_schedule
+      registry_url: https://components.espressif.com
+      require: private
+      version: ~1.3.2
+    - name: espressif/esp_secure_cert_mgr
+      registry_url: https://components.espressif.com
+      require: private
+      version: ^2.2.1
+    - name: espressif/json_generator
+      registry_url: https://components.espressif.com
+      require: private
+      version: ~1.1.1
+    - name: espressif/json_parser
+      registry_url: https://components.espressif.com
+      require: private
+      version: ~1.0.3
+    - name: espressif/mdns
+      registry_url: https://components.espressif.com
+      require: private
+      version: ^1.9.0
+    - name: espressif/network_provisioning
+      registry_url: https://components.espressif.com
+      require: private
+      version: '>=1.*'
+    - name: espressif/rmaker_common
+      registry_url: https://components.espressif.com
+      require: private
+      version: '>=1.7.1'
+    - name: idf
+      require: private
+      version: '>=5.1'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 1.12.4
+  espressif/esp_schedule:
+    component_hash: 024e1ee23cab447e800519f704193cb5b5652297d86811e6e6c653dea42d8bb1
+    dependencies:
+    - name: espressif/esp_daylight
+      registry_url: https://components.espressif.com
+      require: private
+      version: ~1.0.1
+    - name: idf
+      require: private
+      version: '>=5.1'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 1.3.2
+  espressif/esp_secure_cert_mgr:
+    component_hash: 40a986c1f45d91eb6d339ca51dcab90c4ecce2a6622c268edaaa05887852d464
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=4.3'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 2.9.2
+  espressif/jsmn:
+    component_hash: d80350c41bbaa827c98a25b6072df00884e72f54885996fab4a4f0aebce6b6c3
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=4.3'
+    source:
+      registry_url: https://components.espressif.com
+      type: service
+    version: 1.1.0
+  espressif/json_generator:
+    component_hash: 45033e1c199b13f1c8c1b544fb7d4e2df6a8e3071ebdcb1b22582b61a7974ff2
+    dependencies: []
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 1.1.2
+  espressif/json_parser:
+    component_hash: d74b81729ad06ec11ff5eb5b1b0d7df1d00e6027fc11471f4b139c70dcf1b1e4
+    dependencies:
+    - name: espressif/jsmn
+      registry_url: https://components.espressif.com
+      require: private
+      rules:
+      - if: idf_version >=5.0
+      version: ~1.1
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
     version: 1.0.3
   espressif/mdns:
-    component_hash: d96d277207c4fec77ec290b7a8b0ca4043e10f407df0ff6aa52e54a94f0c54a5
+    component_hash: 1ebe3bd675bb9d1c58f52bc0b609b32f74e572b01c328f9e61282040c775495c
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=5.0'
     source:
-      service_url: https://api.components.espressif.com/
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 1.11.0
+  espressif/network_provisioning:
+    component_hash: 72d27784e3daf807418a34fb00be136ec50c6db49d989ce981d22e031fc0e7f8
+    dependencies:
+    - name: espressif/cjson
+      registry_url: https://components.espressif.com
+      require: private
+      rules:
+      - if: idf_version >= 6.0
+      version: ^1.7.19
+    - name: idf
+      require: private
+      version: '>=5.1'
+    source:
+      registry_url: https://components.espressif.com/
       type: service
     version: 1.2.4
-  espressif/rmaker_common:
-    component_hash: null
+  espressif/qrcode:
+    component_hash: 31e70991ce22f28d73a4386417fc9c0993f61e1aab1832474fd9e3db8da9dcbd
+    dependencies: []
     source:
-      path: /home/ralph/.espressif/esp-rainmaker/components/esp-insights/components/rmaker_common
-      type: local
-    version: 1.4.3
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 0.2.0
+  espressif/rmaker_common:
+    component_hash: b299bc04ea98a0b1c065f37c565d3f364b83e4af68bfb69032e058666751fc7e
+    dependencies:
+    - name: espressif/mqtt
+      registry_url: https://components.espressif.com
+      require: private
+      rules:
+      - if: idf_version >=6.0.0
+      version: '*'
+    - name: idf
+      require: private
+      version: '>=5.1'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 1.8.0
   idf:
-    component_hash: null
     source:
       type: idf
-    version: 5.2.0
-  jsmn:
-    component_hash: null
-    source:
-      path: /home/ralph/.espressif/esp-rainmaker/components/jsmn
-      type: local
-    version: 1.1.0
-manifest_hash: 5b24c4102956148ff0920f14bd2d7a48609749296faa780b7ffa74f36befd011
+    version: 5.5.3
+direct_dependencies:
+- espressif/button
+- espressif/cbor
+- espressif/esp_insights
+- espressif/esp_rainmaker
+- espressif/esp_schedule
+- espressif/esp_secure_cert_mgr
+- espressif/json_generator
+- espressif/json_parser
+- espressif/mdns
+- espressif/network_provisioning
+- espressif/qrcode
+- espressif/rmaker_common
+- idf
+manifest_hash: 8593e20503d25fc4ad67dff9f4dcf885e3a65b617f4ea48a1bddd9e92fb39d05
 target: esp32
-version: 1.0.0
+version: 2.0.0

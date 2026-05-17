@@ -8,9 +8,11 @@ else()
   set(RMAKER_PATH ${CMAKE_CURRENT_LIST_DIR}/../..)
 endif(DEFINED ENV{RMAKER_PATH})
 
-# Add RainMaker components and other common application components
-set(EXTRA_COMPONENT_DIRS ${RMAKER_PATH}/components/esp-insights/components ${RMAKER_PATH}/components ${RMAKER_PATH}/examples/common ${CMAKE_CURRENT_LIST_DIR}/components)
+# RainMaker components + example helpers (app_wifi, app_insights, …)
+set(EXTRA_COMPONENT_DIRS ${RMAKER_PATH}/components ${RMAKER_PATH}/examples/common ${CMAKE_CURRENT_LIST_DIR}/components)
 
-set(PROJECT_VER "1.0")
+# Firmware version: root VERSION file (see README)
+file(STRINGS "${CMAKE_CURRENT_LIST_DIR}/VERSION" PROJECT_VER LIMIT_COUNT 1)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_CURRENT_LIST_DIR}/VERSION")
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
-project(switch)
+project(espresso)

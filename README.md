@@ -6,8 +6,9 @@ This project implements a PID/P controller to effectively control the temperatur
 Another feature implemented is the control of the water pump and pre-infusion settings. Combined, these functionalities allow for
 improved espresso extraction and consistency.
 
-March 2024  
-https://github.com/raffarost/espresso
+**Firmware version** is defined in the repository root file [`VERSION`](VERSION); CMake and the legacy `Makefile` set `PROJECT_VER` from it, and the running image reports it via ESP-IDF (`esp_app_get_description()->version`).
+
+April 2026 — https://github.com/raffarost/espresso
 
 Raffael Rostagno  
 raffael.rostagno@gmail.com
@@ -107,10 +108,118 @@ To calibrate the PID controller, the following symbols can be optimized for each
 
 To calibrate the P controller, the following vectors can be changed:
 
-```
-static float   deltaBkp[BKP_NUM] = {-10,  0, 0.5,  1,  2,  4, 10,  25,  50, 100};
-static float controlSet[BKP_NUM] = {  0,  0,   1,  1,  1,  1,  1,  80, 100, 100};
+```c
+/*    delta °C:  -10   0  0.5   1   2   4   10   25   50   70  */
+static float   deltaBkp[BKP_NUM] = {-10,   0,  0.5,   1,   2,   4,   10,   25,   50,   70};
+static float controlSet[BKP_NUM] = {  0,   0,    5,   5,   8,  20,   30,   50,   80,  100};
 ```
 
-The first vector corresponds to the temperature difference between target and actual reading.
-The second vector is the power factor (0 to 100%) to apply for each (interpolated) delta.
+The first vector is the temperature difference between setpoint and actual reading (°C).
+The second vector is the driver power value (0–100) applied for each (interpolated) delta.
+
+##### TRIAC driver hardware constraint
+
+The dimmer driver uses phase-angle control with a **fixed gate pulse width of 4 timer steps**.
+For driver values 1–4, the gate pulse extends beyond the AC half-cycle boundary, re-latching
+the TRIAC at the start of the next half-cycle and delivering ~25 % average power regardless
+of the intended setting.
+
+**Minimum safe value in `controlSet[]` is 5. Never use values 1–4.**  
+Use 0 (heater fully off) or ≥ 5.
+
+##### Actual power delivery vs. driver value
+
+Phase-angle control is highly nonlinear. The driver value does **not** map linearly to
+delivered power — most of the useful range is concentrated above 20.
+
+| Driver value | Approx. actual power (% of rated) |
+|---|---|
+| 5 | ~0.1 % |
+| 10 | ~0.6 % |
+| 15 | ~2 % |
+| 20 | ~5 % |
+| 25 | ~9 % |
+| 30 | ~15 % |
+| 40 | ~31 % |
+| 50 | ~50 % |
+| 60 | ~69 % |
+| 80 | ~95 % |
+| 99 | ~100 % |
+
+Values below ~15 deliver negligible heat and are only useful in `controlSet[]` as a defined
+floor to avoid the gate-overflow bug (see above).  Practical maintenance and warmup
+calibration should use values in the 15–99 range.
+
+#### Adaptive warmup (`ADAPTIVE_WARMUP_ENABLE`)
+
+When `CONTROL_TYPE == LOOKUP`, the adaptive warmup strategy is enabled automatically. It replaces the old fixed-duty power toggle with a self-tuning mechanism that adjusts heater duty during the final approach to setpoint.
+
+##### Dither step table
+
+Within `DELTA_PWR_TOGGLE` (10 °C below setpoint), the heater is pulsed at a duty cycle determined by the current *step index* (0–4):
+
+| Step | Duty  | Period / on-count |
+|------|-------|-------------------|
+| 0    | 100 % | 1 / 1             |
+| 1    |  75 % | 4 / 3             |
+| 2    |  50 % | 2 / 1 — **default** |
+| 3    |  25 % | 4 / 1             |
+
+Within `TEMP_DELTA` (2 °C) of setpoint, the step is overridden to `POWER_NEAR_SETPOINT` (default: step 3, 33 %) regardless of the learned index, to prevent overshoot and overly aggressive fighting between the stall and overshoot detectors near the target.
+
+The current duty is reported in the RainMaker UI as **Power factor (dither)**. The step index is persisted to NVS (`dithStep`) and restored on each reboot, so the machine retains its seasonal calibration across power cycles.
+
+##### Overshoot detection
+
+After the approach phase, if the temperature exceeds `tempSetpoint + TEMP_DELTA`, an overshoot is latched. The peak excursion above setpoint is tracked until the temperature drops back to setpoint, then the step is incremented (less power next warmup):
+
+- Peak < 5 °C → `step + 1`
+- Peak ≥ 5 °C (`OVERSHOOT_SEVERE_PEAK_C`) → `step + 2`
+
+The step is clamped at 4 (25 %). The NVS value is written after the commit.
+
+##### Warmup stall detection
+
+During the approach window, the detector tracks the best (smallest) delta seen since entering the window. A 30-second timer (`DITHER_STALL_SEC`) is reset every time a new delta minimum is recorded. If the timer expires — meaning temperature has not improved in 30 s — a **warmup stall** is declared:
+
+- `step - 1` (more heater power) is applied immediately in RAM.
+- The NVS write is deferred until the end of the warmup cycle (overshoot settle or soft-settle).
+- The **Status** diagnostic field shows `"Warmup stall"` while the stall is active, clearing automatically once the setpoint is reached.
+
+The stall detector is inhibited while `temp_stuck_diag` is active (frozen sensor) to avoid false step adjustments based on stale readings.
+
+##### Self-correcting behaviour
+
+The two detectors naturally balance each other:
+
+- Stall fires → `step - 1` → more power → may cause overshoot → `step + 1` → net 0 (learning discarded)
+- Stall fires → `step - 1` → severe overshoot → `step + 2` → net +1 (learned: needs less power overall)
+
+The step is reset to `DITHER_STEP_DEFAULT` (50 %) via the **Reset power factor** button in the RainMaker UI.
+
+#### Pump heat buffer calibration
+
+When the pump is active (pre-infusion, brew, or flush), cold water entering the boiler causes a
+temperature drop. To compensate, a time-indexed power profile is applied instead of the idle
+temperature controller:
+
+```
+static int pumpOnHeatBuff[PUMP_ON_HEAT_BUFF_LEN] = {
+    100, 100, 100, 100,  80,  80,  50,  50,  40,  40,  40,  50,  50,  50,  50,  70,  70,  70,  70,  70
+};
+```
+
+Each entry is the heater power (0–100%) applied at the corresponding second of pump-on time.
+Index 0 is the first second, index 1 the second, and so on up to `PUMP_ON_HEAT_BUFF_LEN - 1`.
+The vector length must be at least as long as the maximum configured brew time and flush time.
+
+##### Extraction flow dynamics
+
+The power profile follows the natural resistance the coffee puck offers to water flow during extraction:
+
+- **Phase 1 (~4 s)** — Free-flow: water saturates the dry puck with little resistance. Flow rate is high and the boiler cools quickly, so high heater power is needed.
+- **Phase 2 (~4 s)** — Puck compressing: swelling grounds start restricting flow. Less water moves through, so less compensation is required.
+- **Phase 3 (~6 s)** — Maximum compression: the puck is fully saturated and tightly packed. Flow is most restricted and the boiler loses less heat, so power demand is at its lowest.
+- **Phase 4 (~6 s+)** — Puck deterioration: channels begin to form as the grounds break down, flow gradually recovers, and power demand rises again.
+
+This is a general profile — it can vary significantly depending on basket type (single vs. double) and dimensions, coffee dose, grind size, and temperature sensor position within the machine.
